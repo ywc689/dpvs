@@ -341,11 +341,11 @@ static void ipvs_fill_laddr_conf(ipvs_service_t *svc, ipvs_laddr_t *laddr,
 static void ipvs_fill_ipaddr_conf(ipvs_laddr_t *laddr, struct inet_addr_param *param)
 {
 	memset(param, 0, sizeof(*param));
-	param->af = AF_INET;
+	param->af = laddr->af;
 	if (strlen(laddr->ifname))
 		snprintf(param->ifname, sizeof(param->ifname), "%s", laddr->ifname);
 	param->addr.in = laddr->addr.in;
-	param->plen = 32;
+	param->plen = (laddr->af == AF_INET6) ? 128 : 32;
 	param->flags |= IFA_F_SAPOOL;
 	return;
 }
