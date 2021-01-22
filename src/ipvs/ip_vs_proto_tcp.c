@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -17,7 +17,7 @@
  */
 #include <assert.h>
 #include <time.h>
-#include "common.h"
+#include "conf/common.h"
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
@@ -553,6 +553,7 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
 {
     struct tcphdr *th, _tcph;
     struct dp_vs_service *svc;
+    bool outwall = false;
 
     assert(proto && iph && mbuf && conn && verdict);
 
@@ -589,7 +590,8 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
 
         /* Drop tcp packet which is send to vip and !vport */
         if (g_defence_tcp_drop &&
-                (svc = dp_vs_lookup_vip(iph->af, iph->proto, &iph->daddr))) {
+                (svc = dp_vs_vip_lookup(iph->af, iph->proto,
+                                    &iph->daddr, rte_lcore_id()))) {
             dp_vs_estats_inc(DEFENCE_TCP_DROP);
             *verdict = INET_DROP;
             return EDPVS_INVPKT;
@@ -599,12 +601,13 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_INVAL;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto,
-                               &iph->daddr, th->dest, 0, mbuf, NULL);
+    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, th->dest,
+                               0, mbuf, NULL, &outwall, rte_lcore_id());
     if (!svc) {
         /* Drop tcp packet which is send to vip and !vport */
         if (g_defence_tcp_drop &&
-                (svc = dp_vs_lookup_vip(iph->af, iph->proto, &iph->daddr))) {
+                (svc = dp_vs_vip_lookup(iph->af, iph->proto,
+                                   &iph->daddr, rte_lcore_id()))) {
             dp_vs_estats_inc(DEFENCE_TCP_DROP);
             *verdict = INET_DROP;
             return EDPVS_INVPKT;
@@ -613,14 +616,11 @@ static int tcp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_NOSERV;
     }
 
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(svc, iph, mbuf, false, outwall);
     if (!*conn) {
-        dp_vs_service_put(svc);
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
     }
-
-    dp_vs_service_put(svc);
 
     return EDPVS_OK;
 }
@@ -638,7 +638,8 @@ tcp_conn_lookup(struct dp_vs_proto *proto, const struct dp_vs_iphdr *iph,
     if (unlikely(!th))
         return NULL;
 
-    if (dp_vs_blklst_lookup(iph->proto, &iph->daddr, th->dest, &iph->saddr)) {
+    if (dp_vs_blklst_lookup(iph->af, iph->proto, &iph->daddr,
+                th->dest, &iph->saddr)) {
         *drop = true;
         return NULL;
     }
@@ -712,7 +713,7 @@ static int tcp_fnat_in_handler(struct dp_vs_proto *proto,
 
     /* add toa to first data packet */
     if (ntohl(th->ack_seq) == conn->fnat_seq.fdata_seq
-            && !th->syn && !th->rst && !th->fin)
+            && !th->syn && !th->rst /*&& !th->fin*/)
         tcp_in_add_toa(conn, mbuf, th);
 
     tcp_in_adjust_seq(conn, th);
@@ -841,7 +842,6 @@ static int tcp_state_trans(struct dp_vs_proto *proto, struct dp_vs_conn *conn,
     int new_state = DPVS_TCP_S_CLOSE;
     assert(proto && conn && mbuf);
     struct dp_vs_dest *dest = conn->dest;
-    unsigned conn_timeout = 0;
     int af = conn->af;
 #ifdef CONFIG_DPVS_IPVS_DEBUG
     char dbuf[64], cbuf[64];
@@ -898,15 +898,7 @@ tcp_state_out:
     conn->old_state = conn->state; // old_state called when connection reused
     conn->state = new_state;
 
-    if (new_state == DPVS_TCP_S_ESTABLISHED) {
-        conn_timeout = dp_vs_get_conn_timeout(conn);
-        if (unlikely(conn_timeout > 0))
-            conn->timeout.tv_sec = conn_timeout;
-        else
-            conn->timeout.tv_sec = tcp_timeouts[new_state];
-    } else {
-        conn->timeout.tv_sec = tcp_timeouts[new_state];
-    }
+    dp_vs_conn_set_timeout(conn, proto);
 
     if (dest) {
         if (!(conn->flags & DPVS_CONN_F_INACTIVE)
@@ -1155,6 +1147,13 @@ static int tcp_conn_expire(struct dp_vs_proto *proto,
     return EDPVS_OK;
 }
 
+static int tcp_conn_expire_quiescent(struct dp_vs_conn *conn)
+{
+    dp_vs_conn_expire_now(conn);
+
+    return EDPVS_OK;
+}
+
 static void defence_tcp_drop_handler(vector_t tokens)
 {
     RTE_LOG(INFO, IPVS, "defence_tcp_drop ON\n");
@@ -1295,18 +1294,19 @@ static int tcp_exit(struct dp_vs_proto *proto)
 }
 
 struct dp_vs_proto dp_vs_proto_tcp = {
-    .name               = "TCP",
-    .proto              = IPPROTO_TCP,
-    .init               = tcp_init,
-    .exit               = tcp_exit,
-    .conn_sched         = tcp_conn_sched,
-    .conn_lookup        = tcp_conn_lookup,
-    .conn_expire        = tcp_conn_expire,
-    .nat_in_handler     = tcp_snat_in_handler,
-    .nat_out_handler    = tcp_snat_out_handler,
-    .fnat_in_handler    = tcp_fnat_in_handler,
-    .fnat_out_handler   = tcp_fnat_out_handler,
-    .snat_in_handler    = tcp_snat_in_handler,
-    .snat_out_handler   = tcp_snat_out_handler,
-    .state_trans        = tcp_state_trans,
+    .name                  = "TCP",
+    .proto                 = IPPROTO_TCP,
+    .init                  = tcp_init,
+    .exit                  = tcp_exit,
+    .conn_sched            = tcp_conn_sched,
+    .conn_lookup           = tcp_conn_lookup,
+    .conn_expire           = tcp_conn_expire,
+    .conn_expire_quiescent = tcp_conn_expire_quiescent,
+    .nat_in_handler        = tcp_snat_in_handler,
+    .nat_out_handler       = tcp_snat_out_handler,
+    .fnat_in_handler       = tcp_fnat_in_handler,
+    .fnat_out_handler      = tcp_fnat_out_handler,
+    .snat_in_handler       = tcp_snat_in_handler,
+    .snat_out_handler      = tcp_snat_out_handler,
+    .state_trans           = tcp_state_trans,
 };

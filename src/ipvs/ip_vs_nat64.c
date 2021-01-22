@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -47,13 +47,13 @@ int mbuf_6to4(struct rte_mbuf *mbuf,
     if (!ip4h)
         return EDPVS_NOROOM;
 
-    memset(ip4h, 0, sizeof(struct ipv4_hdr));
     ip4h->version_ihl     = ((4 << 4) | 5);
     ip4h->type_of_service = 0;
     ip4h->total_length    = htons(mbuf->pkt_len);
     ip4h->fragment_offset = htons(IPV4_HDR_DF_FLAG);
     ip4h->time_to_live    = ttl;
     ip4h->next_proto_id   = next_prot;
+    ip4h->hdr_checksum    = 0;
     ip4h->src_addr        = saddr->s_addr;
     ip4h->dst_addr        = daddr->s_addr;
     ip4h->packet_id       = 0; // NO FRAG, so 0 is OK?
@@ -86,7 +86,7 @@ int mbuf_4to6(struct rte_mbuf *mbuf,
     if (!ip6h)
         return EDPVS_NOROOM;
 
-    memset(ip6h, 0, sizeof(struct ip6_hdr));
+    ip6h->ip6_flow  = 0;
     ip6h->ip6_vfc   = 0x60;
     ip6h->ip6_plen  = htons(plen);
     ip6h->ip6_nxt   = next_prot;

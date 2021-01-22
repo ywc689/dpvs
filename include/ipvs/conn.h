@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -18,7 +18,7 @@
 #ifndef __DPVS_CONN_H__
 #define __DPVS_CONN_H__
 #include <arpa/inet.h>
-#include "common.h"
+#include "conf/common.h"
 #include "list.h"
 #include "dpdk.h"
 #include "timer.h"
@@ -36,12 +36,15 @@ enum {
 };
 
 enum {
-    DPVS_CONN_F_HASHED          = 0x0040,
-    DPVS_CONN_F_REDIRECT_HASHED = 0x0080,
-    DPVS_CONN_F_INACTIVE        = 0x0100,
-    DPVS_CONN_F_SYNPROXY        = 0x8000,
-    DPVS_CONN_F_TEMPLATE        = 0x1000,
-    DPVS_CONN_F_NOFASTXMIT      = 0x2000,
+    DPVS_CONN_F_HASHED           = 0x0040,
+    DPVS_CONN_F_REDIRECT_HASHED  = 0x0080,
+    DPVS_CONN_F_INACTIVE         = 0x0100,
+    DPVS_CONN_F_IN_TIMER         = 0x0200,
+    DPVS_CONN_F_EXPIRE_QUIESCENT = 0x4000,
+    DPVS_CONN_F_SYNPROXY         = 0x8000,
+    DPVS_CONN_F_TEMPLATE         = 0x1000,
+    DPVS_CONN_F_NOFASTXMIT       = 0x2000,
+    DPVS_CONN_F_ONE_PACKET       = 0x0400,
 };
 
 struct dp_vs_conn_param {
@@ -52,6 +55,7 @@ struct dp_vs_conn_param {
     uint16_t            cport;
     uint16_t            vport;
     uint16_t            ct_dport; /* RS port for template connection */
+    bool                outwall;
 };
 
 struct conn_tuple_hash {
@@ -152,6 +156,10 @@ struct dp_vs_conn {
 
     /* connection redirect in fnat/snat/nat modes */
     struct dp_vs_redirect  *redirect;
+
+    /* flag for gfwip */
+    bool outwall;
+
 } __rte_cache_aligned;
 
 /* for syn-proxy to save all ack packet in conn before rs's syn-ack arrives */
@@ -191,6 +199,11 @@ dp_vs_ct_in_get(int af, uint16_t proto,
 void dp_vs_conn_put(struct dp_vs_conn *conn);
 /* put conn without reset the timer */
 void dp_vs_conn_put_no_reset(struct dp_vs_conn *conn);
+
+unsigned dp_vs_conn_get_timeout(struct dp_vs_conn *conn);
+void dp_vs_conn_set_timeout(struct dp_vs_conn *conn, struct dp_vs_proto *pp);
+
+void dp_vs_conn_expire_now(struct dp_vs_conn *conn);
 
 void ipvs_conn_keyword_value_init(void);
 void install_ipvs_conn_keywords(void);
@@ -276,6 +289,36 @@ static inline void dp_vs_control_add(struct dp_vs_conn *conn, struct dp_vs_conn 
 }
 
 static inline bool
+dp_vs_conn_is_template(struct dp_vs_conn *conn)
+{
+    return  (conn->flags & DPVS_CONN_F_TEMPLATE) ? true : false;
+}
+
+static inline void
+dp_vs_conn_set_template(struct dp_vs_conn *conn)
+{
+    conn->flags |= DPVS_CONN_F_TEMPLATE;
+}
+
+static inline bool
+dp_vs_conn_is_in_timer(struct dp_vs_conn *conn)
+{
+    return (conn->flags & DPVS_CONN_F_IN_TIMER) ? true : false;
+}
+
+static inline void
+dp_vs_conn_set_in_timer(struct dp_vs_conn *conn)
+{
+    conn->flags |= DPVS_CONN_F_IN_TIMER;
+}
+
+static inline void
+dp_vs_conn_clear_in_timer(struct dp_vs_conn *conn)
+{
+    conn->flags &= ~DPVS_CONN_F_IN_TIMER;
+}
+
+static inline bool
 dp_vs_conn_is_redirect_hashed(struct dp_vs_conn *conn)
 {
     return  (conn->flags & DPVS_CONN_F_REDIRECT_HASHED) ? true : false;
@@ -293,7 +336,7 @@ dp_vs_conn_clear_redirect_hashed(struct dp_vs_conn *conn)
     conn->flags &= ~DPVS_CONN_F_REDIRECT_HASHED;
 }
 
-inline uint32_t dp_vs_conn_hashkey(int af,
+uint32_t dp_vs_conn_hashkey(int af,
     const union inet_addr *saddr, uint16_t sport,
     const union inet_addr *daddr, uint16_t dport,
     uint32_t mask);

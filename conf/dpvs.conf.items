@@ -11,9 +11,11 @@
 
 ! global config
 global_defs {
-    #daemon                         <disalbe>
-    log_level   INFO                <none>
-    log_file    /var/log/dpvs.log   <none>
+    #daemon                             <disalbe>
+    log_level         INFO              <none>
+    log_file          /var/log/dpvs.log <none>
+    <init> log_async_mode    off        <off, on|off>
+    <init> pdump      off               <off, on|off>
 }
 
 ! netif config
@@ -33,6 +35,7 @@ netif_defs {
             descriptor_number   512         <512, 16-8192>
         }
         fdir {
+            <init> filter       on          <on, on/off>
             mode                perfect     <perfect, none|signature|perfect|perfect_mac_vlan|perfect_tunnel>
             pballoc             64k         <64k, 64k|128k|256k>
             status              matched     <matched, close|matched|always>
@@ -126,18 +129,31 @@ worker_defs {
             tx_queue_ids     3
         }
     }
+
+    ! kni worker config, optional
+    ! if not configure, kni packets are processed on master lcore
+    <init> worker cpu5 {
+        type    kni
+        cpu_id  5
+        port dpdk0 {
+            tx_queue_ids 6
+        }
+        port dpdk1 {
+            tx_queue_ids 4
+        }
+    }
 }
 
 ! timer config
 timer_defs {
-    # cpu job loops to schedule dpdk timer management
+    # time interval(us) to schedule dpdk timer management
     schedule_interval    500            <10, 1-10000000>
 }
 
 ! dpvs neighbor config
 neigh_defs {
     <init> unres_queue_length  128      <128, 16-8192>
-    <init> timeout             60       <60, 1-3600>
+    timeout                    60       <60, 1-3600>
 }
 
 ! dpvs ipv4 config
@@ -173,8 +189,8 @@ ctrl_defs {
     lcore_msg {
         #bucket_number   256
         <init> ring_size                4096    <4096, 256-524288>
-        <init> multicast_queue_length   257     <256, 16-32768>
         sync_msg_timeout_us             2000    <2000, 1-∞>
+        priority_level                  low     <low, low|norm|high|ign>
     }
     ipc_msg {
         <init> unix_domain /var/run/dpvs_ctrl   </var/run/dpvs_ctrl, max chars: 256>
@@ -188,7 +204,7 @@ ipvs_defs {
         <init> conn_pool_cache      256         <256, 1-∞>
         conn_init_timeout           3           <3, 1-31535999>
         expire_quiescent_template               <disable>
-        fast_xmit_close                         <disable>
+        <init> fast_xmit_close                  <disable>
         <init> redirect             off         <off/on: disable/enable packet redirect>
     }
 

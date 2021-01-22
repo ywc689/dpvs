@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -21,10 +21,15 @@
 #include "list.h"
 #include "dpdk.h"
 #include "inetaddr.h"
+#include "global_data.h"
 #include "timer.h"
 #include "tc/tc.h"
 
 #define RTE_LOGTYPE_NETIF RTE_LOGTYPE_USER1
+
+#ifndef DPVS_MAX_LCORE
+#define DPVS_MAX_LCORE RTE_MAX_LCORE
+#endif
 
 enum {
     NETIF_PORT_FLAG_ENABLED                 = (0x1<<0),
@@ -51,7 +56,7 @@ enum {
 /* maximum bonding slave number */
 #define NETIF_MAX_BOND_SLAVES       32
 /* maximum number of hw addr */
-#define NETIF_MAX_HWADDR            64
+#define NETIF_MAX_HWADDR            1024
 /* maximum number of kni device */
 #define NETIF_MAX_KNI               64
 /* maximum number of DPDK rte device */
@@ -72,10 +77,8 @@ struct netif_queue_conf
 {
     queueid_t id;
     uint16_t len;
-    uint16_t kni_len;
     struct rx_partner *isol_rxq;
     struct rte_mbuf *mbufs[NETIF_MAX_PKT_BURST];
-    struct rte_mbuf *kni_mbufs[NETIF_MAX_PKT_BURST];
 } __rte_cache_aligned;
 
 /*
@@ -100,6 +103,7 @@ struct netif_port_conf
 struct netif_lcore_conf
 {
     lcoreid_t id;
+    enum dpvs_lcore_role_type type;
     /* nic number of this lcore to process */
     int nports;
     /* port list of this lcore to process */
@@ -119,38 +123,17 @@ struct rx_partner {
 /**************************** lcore statistics ***************************/
 struct netif_lcore_stats
 {
-    uint64_t lcore_loop; /* Total number of loops since start */
-    uint64_t pktburst;  /* Total number of receive bursts */
-    uint64_t zpktburst; /* Total number of receive bursts with ZERO packets */
-    uint64_t fpktburst; /* Total number of receive bursts with MAX packets */
-    uint64_t z2hpktburst; /* Total number of receive bursts with [0, 0.5*MAX] packets */
-    uint64_t h2fpktburst; /* Total number of receive bursts with (0.5*MAX, MAX] packets */
-    uint64_t ipackets; /* Total number of successfully received packets. */
-    uint64_t ibytes; /* Total number of successfully received bytes. */
-    uint64_t opackets; /* Total number of successfully transmitted packets. */
-    uint64_t obytes;/* Total number of successfully transmitted bytes. */
-    uint64_t dropped; /* Total number of dropped packets by software. */
-} __rte_cache_aligned;
-
-/**************************** lcore loop job ****************************/
-enum netif_lcore_job_type {
-    NETIF_LCORE_JOB_INIT      = 0,
-    NETIF_LCORE_JOB_LOOP      = 1,
-    NETIF_LCORE_JOB_SLOW      = 2,
-    NETIF_LCORE_JOB_TYPE_MAX  = 3,
-};
-
-struct netif_lcore_loop_job
-{
-    char name[32];
-    void (*func)(void *arg);
-    void *data;
-    enum netif_lcore_job_type type;
-    uint32_t skip_loops; /* for NETIF_LCORE_JOB_SLOW type only */
-#ifdef CONFIG_RECORD_BIG_LOOP
-    uint32_t job_time[DPVS_MAX_LCORE];
-#endif
-    struct list_head list;
+    uint64_t lcore_loop;        /* Total number of loops since start */
+    uint64_t pktburst;          /* Total number of receive bursts */
+    uint64_t zpktburst;         /* Total number of receive bursts with ZERO packets */
+    uint64_t fpktburst;         /* Total number of receive bursts with MAX packets */
+    uint64_t z2hpktburst;       /* Total number of receive bursts with [0, 0.5*MAX] packets */
+    uint64_t h2fpktburst;       /* Total number of receive bursts with (0.5*MAX, MAX] packets */
+    uint64_t ipackets;          /* Total number of successfully received packets. */
+    uint64_t ibytes;            /* Total number of successfully received bytes. */
+    uint64_t opackets;          /* Total number of successfully transmitted packets. */
+    uint64_t obytes;            /* Total number of successfully transmitted bytes. */
+    uint64_t dropped;           /* Total number of dropped packets by software. */
 } __rte_cache_aligned;
 
 /******************* packet type for upper protocol *********************/
@@ -184,6 +167,7 @@ struct netif_kni {
     struct ether_addr addr;
     struct dpvs_timer kni_rtnl_timer;
     int kni_rtnl_fd;
+    struct rte_ring *rx_ring;
 } __rte_cache_aligned;
 
 union netif_bond {
@@ -275,15 +259,14 @@ int netif_rcv(struct netif_port *dev, __be16 eth_type, struct rte_mbuf *mbuf);
 int netif_print_lcore_conf(char *buf, int *len, bool is_all, portid_t pid);
 int netif_print_lcore_queue_conf(lcoreid_t cid, char *buf, int *len, bool title);
 void netif_get_slave_lcores(uint8_t *nb, uint64_t *mask);
-void netif_update_master_loop_cnt(void);
+void netif_update_worker_loop_cnt(void);
 // function only for init or termination //
 int netif_register_master_xmit_msg(void);
 int netif_lcore_conf_set(int lcores, const struct netif_lcore_conf *lconf);
-int netif_lcore_loop_job_register(struct netif_lcore_loop_job *lcore_job);
-int netif_lcore_loop_job_unregister(struct netif_lcore_loop_job *lcore_job);
-int netif_lcore_start(void);
 bool is_lcore_id_valid(lcoreid_t cid);
-bool netif_lcore_is_idle(lcoreid_t cid);
+bool netif_lcore_is_fwd_worker(lcoreid_t cid);
+void lcore_process_packets(struct netif_queue_conf *qconf, struct rte_mbuf **mbufs,
+                           lcoreid_t cid, uint16_t count, bool pkts_from_ring);
 
 /************************** protocol API *****************************/
 int netif_register_pkt(struct pkt_type *pt);
@@ -311,10 +294,17 @@ int netif_get_queue(struct netif_port *port, lcoreid_t id, queueid_t *qid);
 int netif_get_link(struct netif_port *dev, struct rte_eth_link *link);
 int netif_get_promisc(struct netif_port *dev, bool *promisc);
 int netif_get_stats(struct netif_port *dev, struct rte_eth_stats *stats);
+struct netif_port *netif_alloc(size_t priv_size, const char *namefmt,
+                               unsigned int nrxq, unsigned int ntxq,
+                               void (*setup)(struct netif_port *));
+portid_t netif_port_count(void);
+int netif_free(struct netif_port *dev);
+int netif_port_register(struct netif_port *dev);
+int netif_port_unregister(struct netif_port *dev);
 
 /************************** module API *****************************/
-int netif_virtual_devices_add(void);
-int netif_init(const struct rte_eth_conf *conf);
+int netif_vdevs_add(void);
+int netif_init(void);
 int netif_term(void); /* netif layer cleanup */
 int netif_ctrl_init(void); /* netif ctrl plane init */
 int netif_ctrl_term(void); /* netif ctrl plane cleanup */
@@ -323,8 +313,6 @@ void netif_cfgfile_init(void);
 void netif_keyword_value_init(void);
 void install_netif_keywords(void);
 
-/*************************** kni api *******************************/
-void kni_process_on_master(void);
 
 static inline void *netif_priv(struct netif_port *dev)
 {
@@ -336,35 +324,15 @@ static inline struct netif_tc *netif_tc(struct netif_port *dev)
     return &dev->tc;
 }
 
-struct netif_port *netif_alloc(size_t priv_size, const char *namefmt,
-                               unsigned int nrxq, unsigned int ntxq,
-                               void (*setup)(struct netif_port *));
-
-int netif_free(struct netif_port *dev);
-int netif_port_register(struct netif_port *dev);
-int netif_port_unregister(struct netif_port *dev);
-
-static inline int eth_addr_equal(const struct ether_addr *addr1,
-                                 const struct ether_addr *addr2)
+static inline uint16_t dpvs_rte_eth_dev_count(void)
 {
-    const uint16_t *a = (const uint16_t *)addr1;
-    const uint16_t *b = (const uint16_t *)addr2;
-
-    return ((a[0]^b[0]) | (a[1]^b[1]) | (a[2]^b[2])) == 0;
+#if RTE_VERSION < RTE_VERSION_NUM(18, 11, 0, 0)
+    return rte_eth_dev_count();
+#else
+    return rte_eth_dev_count_avail();
+#endif
 }
 
-static inline char *eth_addr_dump(const struct ether_addr *ea,
-                                  char *buf, size_t size)
-{
-    snprintf(buf, size, "%02x:%02x:%02x:%02x:%02x:%02x",
-             ea->addr_bytes[0], ea->addr_bytes[1],
-             ea->addr_bytes[2], ea->addr_bytes[3],
-             ea->addr_bytes[4], ea->addr_bytes[5]);
-    return buf;
-}
-
-portid_t netif_port_count(void);
-void lcore_process_packets(struct netif_queue_conf *qconf, struct rte_mbuf **mbufs,
-                           lcoreid_t cid, uint16_t count, bool pkts_from_ring);
+extern bool dp_vs_fdir_filter_enable;
 
 #endif /* __DPVS_NETIF_H__ */

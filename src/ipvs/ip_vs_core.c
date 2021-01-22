@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -18,7 +18,7 @@
 #include <assert.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/icmp6.h>
-#include "common.h"
+#include "conf/common.h"
 #include "ipv4.h"
 #include "ipv6.h"
 #include "icmp.h"
@@ -111,7 +111,7 @@ static struct dp_vs_conn *dp_vs_sched_persist(struct dp_vs_service *svc,
         ct = dp_vs_ct_in_get(svc->af, iph->proto, &snet, &iph->daddr, 0, ports[1]);
         if (!ct || !dp_vs_check_template(ct)) {
             /* no template found, or the dest of the conn template is not available */
-            dest = svc->scheduler->schedule(svc, mbuf);
+            dest = svc->scheduler->schedule(svc, mbuf, iph);
             if (unlikely(NULL == dest)) {
                 RTE_LOG(WARNING, IPVS, "%s: persist-schedule: no dest found.\n", __func__);
                 return NULL;
@@ -135,7 +135,7 @@ static struct dp_vs_conn *dp_vs_sched_persist(struct dp_vs_service *svc,
          * fw-mark based service: not support */
         ct = dp_vs_ct_in_get(svc->af, iph->proto, &snet, &iph->daddr, 0, 0);
         if (!ct || !dp_vs_check_template(ct)) {
-            dest = svc->scheduler->schedule(svc, mbuf);
+            dest = svc->scheduler->schedule(svc, mbuf, iph);
             if (unlikely(NULL == dest)) {
                 RTE_LOG(WARNING, IPVS, "%s: persist-schedule: no dest found.\n", __func__);
                 return NULL;
@@ -178,7 +178,8 @@ static struct dp_vs_conn *dp_vs_sched_persist(struct dp_vs_service *svc,
 static struct dp_vs_conn *dp_vs_snat_schedule(struct dp_vs_dest *dest,
                                        const struct dp_vs_iphdr *iph,
                                        uint16_t *ports,
-                                       struct rte_mbuf *mbuf)
+                                       struct rte_mbuf *mbuf,
+                                       bool outwall)
 {
     int err;
     struct dp_vs_conn *conn;
@@ -258,7 +259,7 @@ static struct dp_vs_conn *dp_vs_snat_schedule(struct dp_vs_dest *dest,
                     ports[1], saddr6->sin6_port, 0, &param);
         }
     }
-
+    param.outwall = outwall;
     conn = dp_vs_conn_new(mbuf, iph, &param, dest, 0);
     if (!conn) {
         sa_release(NULL, &daddr, &saddr);
@@ -273,12 +274,14 @@ static struct dp_vs_conn *dp_vs_snat_schedule(struct dp_vs_dest *dest,
 struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
                                   const struct dp_vs_iphdr *iph,
                                   struct rte_mbuf *mbuf,
-                                  bool is_synproxy_on)
+                                  bool is_synproxy_on,
+                                  bool outwall)
 {
     uint16_t _ports[2], *ports; /* sport, dport */
     struct dp_vs_dest *dest;
     struct dp_vs_conn *conn;
     struct dp_vs_conn_param param;
+    uint32_t flags = 0;
 
     assert(svc && iph && mbuf);
 
@@ -290,7 +293,7 @@ struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
     if (svc->flags & DP_VS_SVC_F_PERSISTENT)
         return dp_vs_sched_persist(svc, iph,  mbuf, is_synproxy_on);
 
-    dest = svc->scheduler->schedule(svc, mbuf);
+    dest = svc->scheduler->schedule(svc, mbuf, iph);
     if (!dest) {
         RTE_LOG(WARNING, IPVS, "%s: no dest found.\n", __func__);
 #ifdef CONFIG_DPVS_MBUF_DEBUG
@@ -300,7 +303,7 @@ struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
     }
 
     if (dest->fwdmode == DPVS_FWD_MODE_SNAT)
-        return dp_vs_snat_schedule(dest, iph, ports, mbuf);
+        return dp_vs_snat_schedule(dest, iph, ports, mbuf, outwall);
 
     if (unlikely(iph->proto == IPPROTO_ICMP)) {
         struct icmphdr *ich, _icmph;
@@ -335,8 +338,13 @@ struct dp_vs_conn *dp_vs_schedule(struct dp_vs_service *svc,
                               ports[0], ports[1], 0, &param);
     }
 
-    conn = dp_vs_conn_new(mbuf, iph, &param, dest,
-            is_synproxy_on ? DPVS_CONN_F_SYNPROXY : 0);
+    if (is_synproxy_on) {
+        flags |= DPVS_CONN_F_SYNPROXY;
+    }
+    if (svc->flags & DP_VS_SVC_F_ONEPACKET && iph->proto == IPPROTO_UDP) {
+        flags |= DPVS_CONN_F_ONE_PACKET;
+    }
+    conn = dp_vs_conn_new(mbuf, iph, &param, dest, flags);
     if (!conn)
         return NULL;
 
@@ -1003,6 +1011,19 @@ static int __dp_vs_in(void *priv, struct rte_mbuf *mbuf,
             dir = DPVS_CONN_DIR_OUTBOUND;
         else
             dir = DPVS_CONN_DIR_INBOUND;
+    } else {
+        /* assert(conn->dest->svc != NULL); */
+        if (conn->dest && conn->dest->svc &&
+                prot->conn_expire_quiescent &&
+                (conn->dest->svc->flags & DPVS_CONN_F_EXPIRE_QUIESCENT)) {
+            if (rte_atomic16_read(&conn->dest->weight) == 0) {
+                RTE_LOG(INFO, IPVS, "%s: the conn is quiescent, expire it right now,"
+                        " and drop the packet!\n", __func__);
+                prot->conn_expire_quiescent(conn);
+                dp_vs_conn_put(conn);
+                return INET_DROP;
+            }
+        }
     }
 
     if (conn->flags & DPVS_CONN_F_SYNPROXY) {
@@ -1074,16 +1095,15 @@ static int __dp_vs_pre_routing(void *priv, struct rte_mbuf *mbuf,
         return INET_ACCEPT;
 
     /* Drop all ip fragment except ospf */
-    if ((af == AF_INET) && ip4_is_frag(ip4_hdr(mbuf))
-            && (iph.proto != IPPROTO_OSPF)) {
+    if ((af == AF_INET) && ip4_is_frag(ip4_hdr(mbuf))) {
         dp_vs_estats_inc(DEFENCE_IP_FRAG_DROP);
         return INET_DROP;
     }
 
     /* Drop udp packet which send to tcp-vip */
     if (g_defence_udp_drop && IPPROTO_UDP == iph.proto) {
-        if ((svc = dp_vs_lookup_vip(af, IPPROTO_UDP, &iph.daddr)) == NULL) {
-            if ((svc = dp_vs_lookup_vip(af, IPPROTO_TCP, &iph.daddr)) != NULL) {
+        if ((svc = dp_vs_vip_lookup(af, IPPROTO_UDP, &iph.daddr, rte_lcore_id())) == NULL) {
+            if ((svc = dp_vs_vip_lookup(af, IPPROTO_TCP, &iph.daddr, rte_lcore_id())) != NULL) {
                 dp_vs_estats_inc(DEFENCE_UDP_DROP);
                 return INET_DROP;
             }

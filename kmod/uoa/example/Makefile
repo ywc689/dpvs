@@ -1,7 +1,7 @@
 #
 # DPVS is a software load balancer (Virtual Server) based on DPDK.
 #
-# Copyright (C) 2017 iQIYI (www.iqiyi.com).
+# Copyright (C) 2021 iQIYI (www.iqiyi.com).
 # All Rights Reserved.
 #
 # This program is free software; you can redistribute it and/or
@@ -22,7 +22,7 @@
 all: udp_serv uperf opp
 
 CFLAGS = -g -O0
-CFLAGS += -I ../../../include -I ../
+CFLAGS += -I ../../../include/ -I ../../../include/conf -I ../
 
 udp_serv: udp_serv.c
 	gcc $(CFLAGS) -o udp_serv udp_serv.c

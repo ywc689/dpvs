@@ -1,7 +1,25 @@
+/*
+ * DPVS is a software load balancer (Virtual Server) based on DPDK.
+ *
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
+ * All Rights Reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
+
 /* just for testing IPv6, not real ICMPv6 implementation. */
 #include <assert.h>
 #include "ipv6.h"
-#include "common.h"
+#include "conf/common.h"
 #include "icmp6.h"
 #include "ndisc.h"
 
@@ -203,6 +221,7 @@ void icmp6_send(struct rte_mbuf *imbuf, int type, int code, uint32_t info)
         RTE_LOG(DEBUG, ICMP6, "%s: no memory.\n", __func__);
         return;
     }
+    mbuf->userdata = NULL;
     assert(rte_pktmbuf_headroom(mbuf) >= 128); /* for L2/L3 */
     ich = (struct icmp6_hdr*)rte_pktmbuf_append(mbuf, sizeof(struct icmp6_hdr));;
     if (!ich) {

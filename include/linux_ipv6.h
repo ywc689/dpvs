@@ -1,4 +1,9 @@
 /*
+ * DPVS is a software load balancer (Virtual Server) based on DPDK.
+ *
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
+ * All Rights Reserved.
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
  * as published by the Free Software Foundation; either version 2
@@ -9,8 +14,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- */
-/*
+ *
  * modifyed from
  *   linux:include/net/ipv6.h
  *   linux:net/ipv6/addrconf_core.c
@@ -23,7 +27,7 @@
 #include <stdbool.h>
 #include <netinet/in.h>
 #include <linux/if_addr.h>
-#include "common.h"
+#include "conf/common.h"
 #ifdef __DPVS__
 #include "inetaddr.h"
 #endif
@@ -583,6 +587,7 @@ static inline int ipv6_addr_select(struct inet_device *idev,
     int dst_type;
     struct inet_ifaddr *ifa;
     int i;
+    lcoreid_t cid = rte_lcore_id();
 
     dst_type  = __ipv6_addr_type(&daddr->in6);
     dst.addr  = &daddr->in6;
@@ -592,7 +597,9 @@ static inline int ipv6_addr_select(struct inet_device *idev,
     hiscore->rule = -1;
     hiscore->ifa  = NULL;
 
-    list_for_each_entry(ifa, &idev->ifa_list, d_list) {
+    list_for_each_entry(ifa, &idev->ifa_list[cid], d_list) {
+        if (ifa->af != AF_INET6)
+            continue;
 
         if (ifa->flags & IFA_F_TENTATIVE)
             continue;

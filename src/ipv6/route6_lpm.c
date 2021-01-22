@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2018 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -127,15 +127,15 @@ static int rt6_lpm_setup_lcore(void *arg)
 
     this_rt6_default = NULL;
 
-    this_rt6_array = rte_zmalloc_socket("rt6_array",
-            sizeof(struct rt6_array)+sizeof(void*)*g_rt6_array_size, 0, socketid);
+    this_rt6_array = rte_zmalloc("rt6_array",
+            sizeof(struct rt6_array)+sizeof(void*)*g_rt6_array_size, 0);
     if (unlikely(this_rt6_array == NULL)) {
         RTE_LOG(ERR, RT6, "%s: no memory to create rt6_array!", __func__);
         return EDPVS_NOMEM;
     }
 
-    this_rt6_hash = rte_zmalloc_socket("rt6_hash",
-            sizeof(struct list_head)*g_rt6_hash_bucket, 0, socketid);
+    this_rt6_hash = rte_zmalloc("rt6_hash",
+            sizeof(struct list_head)*g_rt6_hash_bucket, 0);
     if (unlikely(this_rt6_hash == NULL)) {
         ret = EDPVS_NOMEM;
         goto rt6_hash_fail;
@@ -219,9 +219,6 @@ static struct route6 *rt6_lpm_input(const struct rte_mbuf *mbuf, struct flow6 *f
     /* FIXME: search hash list for detailed match ? */
     if (rt6->rt6_dev && fl6->fl6_oif && rt6->rt6_dev->id != fl6->fl6_oif->id)
         goto miss;
-    if (!ipv6_addr_any(&rt6->rt6_src.addr) && !ipv6_addr_any(&fl6->fl6_saddr)
-            && !ipv6_addr_equal(&rt6->rt6_src.addr, &fl6->fl6_saddr))
-        goto miss;
 
     rte_atomic32_inc(&rt6->refcnt);
     return rt6;
@@ -242,9 +239,6 @@ static struct route6 *rt6_lpm_output(const struct rte_mbuf *mbuf, struct flow6 *
 
     /* FIXME: search hash list for detailed match ? */
     if (rt6->rt6_dev && fl6->fl6_oif && rt6->rt6_dev->id != fl6->fl6_oif->id)
-        goto miss;
-    if (!ipv6_addr_any(&rt6->rt6_src.addr) && !ipv6_addr_any(&fl6->fl6_saddr)
-                && !ipv6_addr_equal(&rt6->rt6_src.addr, &fl6->fl6_saddr))
         goto miss;
 
     rte_atomic32_inc(&rt6->refcnt);
@@ -287,12 +281,13 @@ static int rt6_add_lcore_default(const struct dp_vs_route6_conf *rt6_cfg)
     if (this_rt6_default)
         return EDPVS_EXIST;
 
-    entry = rte_zmalloc_socket("rt6_entry", sizeof(struct route6), 0, rte_socket_id());
+    entry = rte_zmalloc("rt6_entry", sizeof(struct route6), 0);
     if (unlikely(entry == NULL))
         return EDPVS_NOMEM;
 
     /* 'rt6_cfg' has been verified by 'rt6_default' */
     rt6_fill_with_cfg(entry, rt6_cfg);
+    INIT_LIST_HEAD(&entry->hnode);
     rte_atomic32_set(&entry->refcnt, 1);
     this_rt6_default = entry;
 
@@ -338,7 +333,7 @@ static int rt6_lpm_add_lcore(const struct dp_vs_route6_conf *rt6_cfg)
     if (unlikely(ret != EDPVS_OK))
         goto rt6_add_fail;
 
-    entry = rte_zmalloc_socket("rt6_entry", sizeof(struct route6), 0, rte_socket_id());
+    entry = rte_zmalloc("rt6_entry", sizeof(struct route6), 0);
     if (unlikely(entry == NULL)) {
         ret = EDPVS_NOMEM;
         goto rt6_add_fail;
@@ -448,9 +443,12 @@ static struct dp_vs_route6_conf_array *rt6_lpm_dump(
     else
         *nbytes = sizeof(struct dp_vs_route6_conf_array) +\
                   (g_nroutes) * sizeof(struct dp_vs_route6_conf);
-    rt6_arr = rte_zmalloc_socket("rt6_sockopt_get", *nbytes, 0, rte_socket_id());
-    if (unlikely(!rt6_arr))
+    rt6_arr = rte_zmalloc("rt6_sockopt_get", *nbytes, 0);
+    if (unlikely(!rt6_arr)) {
+        RTE_LOG(WARNING, RT6, "%s: rte_zmalloc null!\n",
+            __func__);
         return NULL;
+    }
 
     off = 0;
     for (i = 0; i < g_rt6_hash_bucket; i++) {

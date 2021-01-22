@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -18,6 +18,7 @@
 #ifndef __DPVS_DPDK_H__
 #define __DPVS_DPDK_H__
 #include <rte_common.h>
+#include <rte_version.h>
 #include <rte_vect.h>
 #include <rte_byteorder.h>
 #include <rte_log.h>
@@ -55,10 +56,19 @@
 #include <rte_kni.h>
 #include <rte_ip_frag.h>
 #include <rte_eth_bond.h>
+#include <rte_eth_bond_8023ad.h>
 #include "mbuf.h"
+#ifdef CONFIG_DPVS_PDUMP
+#include <rte_pdump.h>
+#endif
 
-typedef uint8_t lcoreid_t;
-typedef uint16_t portid_t;
-typedef uint16_t queueid_t;
+#ifdef RTE_LOG
+extern int dpvs_log(uint32_t level, uint32_t logtype, const char *func, int line, const char *format, ...);
+#undef RTE_LOG
+#define RTE_LOG(l, t, ...)                  \
+    dpvs_log(RTE_LOG_ ## l,                   \
+        RTE_LOGTYPE_ ## t,  __func__, __LINE__, # t ": " __VA_ARGS__)
+#endif
+
 
 #endif /* __DPVS_DPDK_H__ */

@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -31,7 +31,7 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include "common.h"
+#include "conf/common.h"
 #include "dpdk.h"
 #include "netif.h"
 #include "netif_addr.h"
@@ -57,8 +57,21 @@ static void kni_fill_conf(const struct netif_port *dev, const char *ifname,
 
     if (dev->type == PORT_TYPE_GENERAL) { /* dpdk phy device */
         rte_eth_dev_info_get(dev->id, &info);
+#if RTE_VERSION < RTE_VERSION_NUM(18, 11, 0, 0)
         conf->addr = info.pci_dev->addr;
         conf->id = info.pci_dev->id;
+#else
+        if (info.device) {
+            const struct rte_bus *bus = NULL;
+            const struct rte_pci_device *pci_dev;
+            bus = rte_bus_find_by_device(info.device);
+            if (bus && !strcmp(bus->name, "pci")) {
+                pci_dev = RTE_DEV_TO_PCI(info.device);
+                conf->addr = pci_dev->addr;
+                conf->id = pci_dev->id;
+            }
+        }
+#endif
     }
 
     if (ifname && strlen(ifname))
@@ -321,6 +334,8 @@ int kni_add_dev(struct netif_port *dev, const char *kniname)
     struct rte_kni_conf conf;
     struct rte_kni *kni;
     int err;
+    char ring_name[RTE_RING_NAMESIZE];
+    struct rte_ring *rb;
 
     if (!dev)
         return EDPVS_INVAL;
@@ -360,9 +375,20 @@ int kni_add_dev(struct netif_port *dev, const char *kniname)
                 __func__, mac, conf.name, strerror(errno));
     }
 
+    snprintf(ring_name, sizeof(ring_name), "kni_rx_ring_%s",
+             conf.name);
+    rb = rte_ring_create(ring_name, KNI_DEF_MBUF_SIZE,
+                         rte_socket_id(), RING_F_SC_DEQ);
+    if (unlikely(!rb)) {
+        RTE_LOG(ERR, KNI, "[%s] Failed to create kni rx ring.\n", __func__);
+        rte_kni_release(kni);
+        return EDPVS_DPDKAPIFAIL;
+    }
+
     snprintf(dev->kni.name, sizeof(dev->kni.name), "%s", conf.name);
     dev->kni.addr = dev->addr;
     dev->kni.kni = kni;
+    dev->kni.rx_ring = rb;
     return EDPVS_OK;
 }
 
@@ -372,7 +398,9 @@ int kni_del_dev(struct netif_port *dev)
         return EDPVS_INVAL;
 
     rte_kni_release(dev->kni.kni);
+    rte_ring_free(dev->kni.rx_ring);
     dev->kni.kni = NULL;
+    dev->kni.rx_ring = NULL;
     return EDPVS_OK;
 }
 

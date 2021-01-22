@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -101,7 +101,7 @@ static int sch_recycle(void *arg)
     struct Qsch *sch = arg;
 
     if (rte_atomic32_read(&sch->refcnt)) {
-        dpvs_timer_reset(&sch->rc_timer, true);
+        dpvs_timer_reset_nolock(&sch->rc_timer, true);
         RTE_LOG(WARNING, TC, "%s: sch %u is in use.\n", __func__, sch->handle);
         return DTIMER_OK;
     }

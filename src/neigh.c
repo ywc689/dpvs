@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -26,11 +26,13 @@
 #include "parser/parser.h"
 #include "netif.h"
 #include "neigh.h"
-#include "common.h"
+#include "conf/common.h"
 #include "route.h"
 #include "ctrl.h"
 #include "ndisc.h"
 #include "conf/neigh.h"
+#include "scheduler.h"
+#include "mempool.h"
 
 #define NEIGH_ENTRY_BUFF_SIZE_DEF 128
 #define NEIGH_ENTRY_BUFF_SIZE_MIN 16
@@ -40,7 +42,8 @@
 #define DPVS_NEIGH_TIMEOUT_MIN 1
 #define DPVS_NEIGH_TIMEOUT_MAX 3600
 
-static int neigh_nums[DPVS_MAX_LCORE] = {0};
+static int neigh_nums[DPVS_MAX_LCORE] = { 0 };
+static struct dpvs_mempool *neigh_mempool;
 
 struct neighbour_mbuf_entry {
     struct rte_mbuf   *m;
@@ -128,16 +131,16 @@ void neigh_keyword_value_init(void)
     if (dpvs_state_get() == DPVS_STATE_INIT) {
         /* KW_TYPE_INIT keyword */
         arp_unres_qlen = NEIGH_ENTRY_BUFF_SIZE_DEF;
-        nud_timeouts[DPVS_NUD_S_REACHABLE] = DPVS_NEIGH_TIMEOUT_DEF;
     }
     /* KW_TYPE_NORMAL keyword */
+    nud_timeouts[DPVS_NUD_S_REACHABLE] = DPVS_NEIGH_TIMEOUT_DEF;
 }
 
 void install_neighbor_keywords(void)
 {
     install_keyword_root("neigh_defs", NULL);
     install_keyword("unres_queue_length", unres_qlen_handler, KW_TYPE_INIT);
-    install_keyword("timeout", timeout_handler, KW_TYPE_INIT);
+    install_keyword("timeout", timeout_handler, KW_TYPE_NORMAL);
 }
 
 static lcoreid_t master_cid = 0;
@@ -161,7 +164,6 @@ static inline char *eth_addr_itoa(const struct ether_addr *src, char *dst, size_
     return dst;
 }
 
-
 #ifdef CONFIG_DPVS_NEIGH_DEBUG
 static void dump_arp_hdr(const char *msg, const struct arp_hdr *ah, portid_t port)
 {
@@ -184,17 +186,44 @@ static void dump_arp_hdr(const char *msg, const struct arp_hdr *ah, portid_t por
     }
     fprintf(stderr, "\n");
 }
+#endif
 
-#else
-static inline void dump_arp_hdr(const char *msg, const struct arp_hdr *ah, portid_t port)
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
+static int dump_neigh_entry(const struct neighbour_entry *ne, char *buf, size_t buflen)
 {
+    size_t slen = 0;
+    char fmtbuf[256];
+
+    if (!ne || !buf || buflen < 1)
+        return EDPVS_INVAL;
+
+    buf[0] = '\0';
+    snprintf(&buf[slen], buflen - slen, "ip=%s",
+            inet_ntop(ne->af, &ne->ip_addr, fmtbuf, sizeof(fmtbuf)));
+    if ((slen = strlen(buf)) + 1 >= buflen)
+        return slen;
+
+    snprintf(&buf[slen], buflen - slen, ", mac=%s",
+            eth_addr_itoa(&ne->eth_addr, fmtbuf, sizeof(fmtbuf)));
+    if ((slen = strlen(buf)) + 1 >= buflen)
+        return slen;
+
+    snprintf(&buf[slen], buflen - slen, ", %s", ne->port->name);
+    if ((slen = strlen(buf)) + 1 >= buflen)
+        return slen;
+
+    snprintf(&buf[slen], buflen - slen, ", que_num=%d, state=%d, ts=%d, flag=0x%x",
+            ne->que_num, ne->state, ne->ts, ne->flag);
+
+    return strlen(buf);
 }
 #endif
 
 static inline int neigh_hash(struct neighbour_entry *neighbour, unsigned int hashkey)
 {
     lcoreid_t cid = rte_lcore_id();
-    if(!(neighbour->flag & NEIGHBOUR_HASHED)){
+
+    if (!(neighbour->flag & NEIGHBOUR_HASHED)) {
         list_add(&neighbour->neigh_list, &neigh_table[cid][hashkey]);
         neighbour->flag |= NEIGHBOUR_HASHED;
         return EDPVS_OK;
@@ -205,17 +234,14 @@ static inline int neigh_hash(struct neighbour_entry *neighbour, unsigned int has
 
 static inline int neigh_unhash(struct neighbour_entry *neighbour)
 {
-    int err;
-    if((neighbour->flag & NEIGHBOUR_HASHED)){
+    if (neighbour->flag & NEIGHBOUR_HASHED) {
         list_del(&neighbour->neigh_list);
         neighbour->flag &= ~NEIGHBOUR_HASHED;
-        err = EDPVS_OK;
-    } else {
-        err = EDPVS_NOTEXIST;
+        return EDPVS_OK;
     }
-    if (unlikely(err == EDPVS_NOTEXIST))
-        RTE_LOG(DEBUG, NEIGHBOUR, "%s: neighbour entry not hashed.\n", __func__);
-    return err;
+
+    RTE_LOG(DEBUG, NEIGHBOUR, "%s: neighbour entry not hashed.\n", __func__);
+    return EDPVS_NOTEXIST;
 }
 
 static inline bool neigh_key_cmp(int af, const struct neighbour_entry *neighbour,
@@ -231,19 +257,28 @@ static int neigh_entry_expire(struct neighbour_entry *neighbour)
 {
     struct neighbour_mbuf_entry *mbuf, *mbuf_next;
     lcoreid_t cid = rte_lcore_id();
+    assert(cid != master_cid);
 
-    dpvs_timer_cancel(&neighbour->timer, false);
+    dpvs_timer_cancel_nolock(&neighbour->timer, false);
     neigh_unhash(neighbour);
-        //release pkts saved in neighbour entry
-    list_for_each_entry_safe(mbuf,mbuf_next,
-              &neighbour->queue_list,neigh_mbuf_list){
+
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
+    {
+        char buf[512];
+        dump_neigh_entry(neighbour, buf, sizeof(buf));
+        RTE_LOG(INFO, NEIGHBOUR, "%s:[%02d] del neigh entry: %s\n", __func__, cid, buf);
+    }
+#endif
+
+    /* release pkts saved in neighbour entry */
+    list_for_each_entry_safe(mbuf, mbuf_next,
+              &neighbour->queue_list, neigh_mbuf_list) {
         list_del(&mbuf->neigh_mbuf_list);
         rte_pktmbuf_free(mbuf->m);
-        rte_free(mbuf);
+        dpvs_mempool_put(neigh_mempool, mbuf);
     }
 
-    rte_free(neighbour);
-    assert(cid != master_cid);
+    dpvs_mempool_put(neigh_mempool, neighbour);
     neigh_nums[cid]--;
 
     return DTIMER_STOP;
@@ -253,7 +288,7 @@ void neigh_entry_state_trans(struct neighbour_entry *neighbour, int idx)
 {
     struct timeval timeout;
 
-    /*DPVS_NUD_S_KEEP is not a real state, just use it to keep original state*/
+    /* DPVS_NUD_S_KEEP is not a real state, just use it to keep original state */
     if ((nud_states[idx].next_state[neighbour->state] != DPVS_NUD_S_KEEP)
         && !(neighbour->flag & NEIGHBOUR_STATIC)) {
         int old_state = neighbour->state;
@@ -264,17 +299,24 @@ void neigh_entry_state_trans(struct neighbour_entry *neighbour, int idx)
             if (likely(clock_gettime(CLOCK_REALTIME_COARSE, &now)) == 0)
                 /* frequent timer updates hurt performance,
                  * do not update timer unless half timeout passed */
-                if ((now.tv_sec - neighbour->ts)*2 < nud_timeouts[old_state])
+                if ((now.tv_sec - neighbour->ts) * 2 < nud_timeouts[old_state])
                     return;
         }
 
         timeout.tv_sec = nud_timeouts[neighbour->state];
         timeout.tv_usec = 0;
-        dpvs_timer_update(&neighbour->timer, &timeout, false);
+        dpvs_time_rand_delay(&timeout, 200000); /* delay 200ms randomly to avoid timer performance problem */
+        dpvs_timer_update_nolock(&neighbour->timer, &timeout, false);
         neighbour->ts = now.tv_sec;
 #ifdef CONFIG_DPVS_NEIGH_DEBUG
-        RTE_LOG(DEBUG, NEIGHBOUR, "%s trans state to %s.\n",
-               nud_state_name(old_state), nud_state_name(neighbour->state));
+        if (neighbour->state != old_state)
+        {
+            char buf[512];
+            dump_neigh_entry(neighbour, buf, sizeof(buf));
+            RTE_LOG(INFO, NEIGHBOUR, "[%02d] neighbor (%s) trans state: %s -> %s, idx:%d.\n",
+                    rte_lcore_id(), buf, nud_state_name(old_state),
+                    nud_state_name(neighbour->state), idx);
+        }
 #endif
     }
 }
@@ -321,9 +363,8 @@ struct neighbour_entry *neigh_add_table(int af, const union inet_addr *ipaddr,
     struct timeval delay;
     lcoreid_t cid = rte_lcore_id();
 
-    new_neighbour = rte_zmalloc("new_neighbour_entry",
-                    sizeof(struct neighbour_entry), RTE_CACHE_LINE_SIZE);
-    if(new_neighbour == NULL)
+    new_neighbour = dpvs_mempool_get(neigh_mempool, sizeof(struct neighbour_entry));
+    if (unlikely(new_neighbour == NULL))
         return NULL;
 
     rte_memcpy(&new_neighbour->ip_addr, ipaddr,
@@ -331,11 +372,10 @@ struct neighbour_entry *neigh_add_table(int af, const union inet_addr *ipaddr,
     new_neighbour->flag = flag;
     new_neighbour->af   = af;
 
-    if(eth_addr){
+    if (eth_addr) {
         rte_memcpy(&new_neighbour->eth_addr, eth_addr, 6);
         new_neighbour->state = DPVS_NUD_S_REACHABLE;
-    }
-    else{
+    } else {
         new_neighbour->state = DPVS_NUD_S_NONE;
     }
 
@@ -347,12 +387,24 @@ struct neighbour_entry *neigh_add_table(int af, const union inet_addr *ipaddr,
     INIT_LIST_HEAD(&new_neighbour->queue_list);
 
     if (!(new_neighbour->flag & NEIGHBOUR_STATIC)) {
+#ifdef CONFIG_TIMER_DEBUG
+        snprintf(new_neighbour->timer.name, sizeof(new_neighbour->timer.name), "%s", "neigh");
+#endif
+        dpvs_time_rand_delay(&delay, 200000); /* delay 200ms randomly to avoid timer performance problem */
         dpvs_timer_sched(&new_neighbour->timer, &delay,
                 neighbour_timer_event, new_neighbour, false);
     }
 
     neigh_hash(new_neighbour, hashkey);
     neigh_nums[cid]++;
+
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
+    {
+        char buf[512];
+        dump_neigh_entry(new_neighbour, buf, sizeof(buf));
+        RTE_LOG(INFO, NEIGHBOUR, "[%02d] add neigh entry: %s\n", cid, buf);
+    }
+#endif
 
     return new_neighbour;
 }
@@ -388,13 +440,13 @@ void neigh_send_mbuf_cach(struct neighbour_entry *neighbour)
     struct rte_mbuf *m;
 
     list_for_each_entry_safe(mbuf, mbuf_next,
-                             &neighbour->queue_list,neigh_mbuf_list){
+                             &neighbour->queue_list, neigh_mbuf_list) {
         list_del(&mbuf->neigh_mbuf_list);
         m = mbuf->m;
         neigh_fill_mac(neighbour, m, NULL, neighbour->port);
         netif_xmit(m, neighbour->port);
         neighbour->que_num--;
-        rte_free(mbuf);
+        dpvs_mempool_put(neigh_mempool, mbuf);
     }
 }
 
@@ -403,6 +455,7 @@ void neigh_confirm(int af, union inet_addr *nexthop, struct netif_port *port)
     struct neighbour_entry *neighbour;
     unsigned int hashkey;
     lcoreid_t cid = rte_lcore_id();
+
     /*find nexhop/neighbour to confirm, no matter whether it is the route in*/
     hashkey = neigh_hashkey(af, nexthop, port);
     list_for_each_entry(neighbour, &neigh_table[cid][hashkey], neigh_list) {
@@ -422,27 +475,23 @@ static void neigh_state_confirm(struct neighbour_entry *neighbour)
     if (neighbour->af == AF_INET) {
         daddr.in.s_addr = neighbour->ip_addr.in.s_addr;
         inet_addr_select(AF_INET, neighbour->port, &daddr, 0, &saddr);
-        if (!saddr.in.s_addr) {
-            RTE_LOG(ERR, NEIGHBOUR, "[%s]no source ip\n", __func__);
-        }
+        if (!saddr.in.s_addr)
+            RTE_LOG(ERR, NEIGHBOUR, "%s: no source ip\n", __func__);
 
         if (neigh_send_arp(neighbour->port, saddr.in.s_addr,
-                           daddr.in.s_addr) != EDPVS_OK) {
-            RTE_LOG(ERR, NEIGHBOUR, "[%s] send arp failed\n", __func__);
-        }
+                           daddr.in.s_addr) != EDPVS_OK)
+            RTE_LOG(ERR, NEIGHBOUR, "%s: send arp failed\n", __func__);
     } else if (neighbour->af == AF_INET6) {
-        /*to be continue*/
         ipv6_addr_copy(&daddr.in6, &neighbour->ip_addr.in6);
         inet_addr_select(AF_INET6, neighbour->port, &daddr, 0, &saddr);
 
         if (ipv6_addr_any(&saddr.in6))
-            RTE_LOG(ERR, NEIGHBOUR, "[%s]no source ip\n", __func__);
+            RTE_LOG(ERR, NEIGHBOUR, "%s: no source ip\n", __func__);
 
         ndisc_solicit(neighbour, &saddr.in6);
     }
 }
 
-/*arp*/
 int neigh_resolve_input(struct rte_mbuf *m, struct netif_port *port)
 {
     struct arp_hdr *arp = rte_pktmbuf_mtod(m, struct arp_hdr *);
@@ -465,7 +514,7 @@ int neigh_resolve_input(struct rte_mbuf *m, struct netif_port *port)
         rte_memcpy(&eth->s_addr, &port->addr, 6);
         arp->arp_op = rte_cpu_to_be_16(ARP_OP_REPLY);
 
-        ether_addr_copy(&arp->arp_data.arp_sha, &arp->arp_data.arp_tha);//from to
+        ether_addr_copy(&arp->arp_data.arp_sha, &arp->arp_data.arp_tha);
         ether_addr_copy(&eth->s_addr, &arp->arp_data.arp_sha);
 
         ipaddr = arp->arp_data.arp_sip;
@@ -477,24 +526,23 @@ int neigh_resolve_input(struct rte_mbuf *m, struct netif_port *port)
         netif_xmit(m, port);
         return EDPVS_OK;
 
-    } else if(arp->arp_op == htons(ARP_OP_REPLY)) {
+    } else if (arp->arp_op == htons(ARP_OP_REPLY)) {
         ipaddr = arp->arp_data.arp_sip;
         hashkey = neigh_hashkey(AF_INET, (union inet_addr *)&ipaddr, port);
         neighbour = neigh_lookup_entry(AF_INET, (union inet_addr *)&ipaddr,
                                        port, hashkey);
         if (neighbour && !(neighbour->flag & NEIGHBOUR_STATIC)) {
             neigh_edit(neighbour, &arp->arp_data.arp_sha);
-            neigh_entry_state_trans(neighbour, 1);
         } else {
             neighbour = neigh_add_table(AF_INET, (union inet_addr *)&ipaddr,
                                     &arp->arp_data.arp_sha, port, hashkey, 0);
-            if(!neighbour){
-                RTE_LOG(ERR, NEIGHBOUR, "[%s] add neighbour wrong\n", __func__);
+            if (!neighbour) {
+                RTE_LOG(ERR, NEIGHBOUR, "%s: add neighbour wrong\n", __func__);
                 rte_pktmbuf_free(m);
                 return EDPVS_NOMEM;
             }
-            neigh_entry_state_trans(neighbour, 1);
         }
+        neigh_entry_state_trans(neighbour, 1);
         neigh_send_mbuf_cach(neighbour);
         return EDPVS_KNICONTINUE;
     } else {
@@ -512,14 +560,15 @@ static int neigh_send_arp(struct netif_port *port, uint32_t src_ip, uint32_t dst
     uint32_t addr;
 
     m = rte_pktmbuf_alloc(port->mbuf_pool);
-    if(unlikely(m==NULL)){
+    if (unlikely(m == NULL)) {
         return EDPVS_NOMEM;
     }
+    m->userdata = NULL;
 
     eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
     arp = (struct arp_hdr *)&eth[1];
 
-    memset(&eth->d_addr,0xFF,6);
+    memset(&eth->d_addr, 0xFF, 6);
     ether_addr_copy(&port->addr, &eth->s_addr);
     eth->ether_type = htons(ETHER_TYPE_ARP);
 
@@ -544,9 +593,42 @@ static int neigh_send_arp(struct netif_port *port, uint32_t src_ip, uint32_t dst
 
     memset(&arp[1], 0, 18);
 
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
     dump_arp_hdr("send", arp, port->id);
+#endif
+
     netif_xmit(m, port);
     return EDPVS_OK;
+}
+
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
+static inline void neigh_show_nexthop(const char *func, int af,
+                                      const union inet_addr *nexhop,
+                                      const struct netif_port *port)
+{
+    char buf[64];
+
+    RTE_LOG(DEBUG, NEIGHBOUR,
+            "%s: [%d] port %s, nexthop %s\n",
+            func, rte_lcore_id(), port->name,
+            nexhop ? inet_ntop(af, nexhop, buf, sizeof(buf)) : "::");
+}
+#endif
+
+static inline void neigh_show_entry(const char *func,
+                                    struct neighbour_entry *neigh)
+{
+    char ipaddr[64];
+
+    RTE_LOG(ERR, NEIGHBOUR,
+            "%s: [%d] ip %s, state %s, %d (> %d) packets "
+            "queued on %s so drop the packet",
+            func, rte_lcore_id(),
+            inet_ntop(neigh->af, &neigh->ip_addr, ipaddr, sizeof(ipaddr))
+            ? ipaddr : "::",
+            nud_state_names[neigh->state],
+            neigh->que_num, arp_unres_qlen,
+            neigh->port ? neigh->port->name : "null i/f");
 }
 
 int neigh_output(int af, union inet_addr *nexhop,
@@ -564,28 +646,34 @@ int neigh_output(int af, union inet_addr *nexhop,
         return netif_xmit(m, port);
     }
 
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
+    neigh_show_nexthop(__func__, af, nexhop, port);
+#endif
+
     hashkey = neigh_hashkey(af, nexhop, port);
     neighbour = neigh_lookup_entry(af, nexhop, port, hashkey);
 
     if (neighbour) {
-        if ((neighbour->state == DPVS_NUD_S_NONE) ||
-           (neighbour->state == DPVS_NUD_S_SEND)) {
+        switch (neighbour->state) {
+        case DPVS_NUD_S_NONE:
+        case DPVS_NUD_S_SEND:
             if (neighbour->que_num > arp_unres_qlen) {
+                neigh_show_entry(__func__, neighbour);
                 /*
                  * don't need arp request now,
                  * since neighbour will not be confirmed
                  * and it will be released late
                  */
                 rte_pktmbuf_free(m);
-                RTE_LOG(ERR, NEIGHBOUR, "[%s] neigh_unres_queue is full, drop packet\n", __func__);
                 return EDPVS_DROP;
             }
-            m_buf = rte_zmalloc("neigh_new_mbuf",
-                               sizeof(struct neighbour_mbuf_entry), RTE_CACHE_LINE_SIZE);
-            if (!m_buf) {
+
+            m_buf = dpvs_mempool_get(neigh_mempool, sizeof(struct neighbour_mbuf_entry));
+            if (unlikely(!m_buf)) {
                 rte_pktmbuf_free(m);
                 return EDPVS_DROP;
             }
+
             m_buf->m = m;
             list_add_tail(&m_buf->neigh_mbuf_list, &neighbour->queue_list);
             neighbour->que_num++;
@@ -594,12 +682,12 @@ int neigh_output(int af, union inet_addr *nexhop,
                 neigh_state_confirm(neighbour);
                 neigh_entry_state_trans(neighbour, 0);
             }
-            return EDPVS_OK;
-        }
-        else if ((neighbour->state == DPVS_NUD_S_REACHABLE) ||
-                 (neighbour->state == DPVS_NUD_S_PROBE) ||
-                 (neighbour->state == DPVS_NUD_S_DELAY)) {
 
+            return EDPVS_OK;
+
+        case DPVS_NUD_S_REACHABLE:
+        case DPVS_NUD_S_PROBE:
+        case DPVS_NUD_S_DELAY:
             neigh_fill_mac(neighbour, m, NULL, port);
             netif_xmit(m, neighbour->port);
 
@@ -609,38 +697,35 @@ int neigh_output(int af, union inet_addr *nexhop,
             }
 
             return EDPVS_OK;
-        }
 
-        return EDPVS_IDLE;
+        default:
+            return EDPVS_IDLE;
+        }
     }
-    else{
-        neighbour = neigh_add_table(af, nexhop, NULL, port, hashkey, 0);
-        if(!neighbour){
-            RTE_LOG(ERR, NEIGHBOUR, "[%s] add neighbour wrong\n", __func__);
-            rte_pktmbuf_free(m);
-            return EDPVS_NOMEM;
-        }
-        if(neighbour->que_num > arp_unres_qlen){
-            rte_pktmbuf_free(m);
-            return EDPVS_DROP;
-        }
-        m_buf = rte_zmalloc("neigh_new_mbuf",
-                           sizeof(struct neighbour_mbuf_entry), RTE_CACHE_LINE_SIZE);
-        if(!m_buf){
-            rte_pktmbuf_free(m);
-            return EDPVS_DROP;
-        }
-        m_buf->m = m;
-        list_add_tail(&m_buf->neigh_mbuf_list, &neighbour->queue_list);
-        neighbour->que_num++;
 
-        if (neighbour->state == DPVS_NUD_S_NONE) {
-            neigh_state_confirm(neighbour);
-            neigh_entry_state_trans(neighbour, 0);
-        }
-
-        return EDPVS_OK;
+    /* create the neighbour entry if not found */
+    neighbour = neigh_add_table(af, nexhop, NULL, port, hashkey, 0);
+    if (!neighbour) {
+        RTE_LOG(ERR, NEIGHBOUR, "%s: add neighbour wrong\n", __func__);
+        rte_pktmbuf_free(m);
+        return EDPVS_NOMEM;
     }
+
+    m_buf = dpvs_mempool_get(neigh_mempool, sizeof(struct neighbour_mbuf_entry));
+    if (unlikely(!m_buf)) {
+        rte_pktmbuf_free(m);
+        return EDPVS_DROP;
+    }
+    m_buf->m = m;
+    list_add_tail(&m_buf->neigh_mbuf_list, &neighbour->queue_list);
+    neighbour->que_num++;
+
+    if (neighbour->state == DPVS_NUD_S_NONE) {
+        neigh_state_confirm(neighbour);
+        neigh_entry_state_trans(neighbour, 0);
+    }
+
+    return EDPVS_OK;
 }
 
 int neigh_gratuitous_arp(struct in_addr *src_ip, struct netif_port *port)
@@ -679,8 +764,9 @@ static struct raw_neigh* neigh_ring_clone_entry(const struct neighbour_entry* ne
                                                 bool add)
 {
     struct raw_neigh* mac_param;
-    mac_param = rte_zmalloc("mac_entry", sizeof(struct raw_neigh), RTE_CACHE_LINE_SIZE);
-    if (mac_param == NULL)
+
+    mac_param = dpvs_mempool_get(neigh_mempool, sizeof(struct raw_neigh));
+    if (unlikely(mac_param == NULL))
         return NULL;
     mac_param->af = neighbour->af;
     rte_memcpy(&mac_param->ip_addr, &neighbour->ip_addr, sizeof(union inet_addr));
@@ -689,6 +775,7 @@ static struct raw_neigh* neigh_ring_clone_entry(const struct neighbour_entry* ne
     mac_param->add = add;
     /*just copy*/
     rte_memcpy(&mac_param->eth_addr, &neighbour->eth_addr, 6);
+
     return mac_param;
 }
 
@@ -697,16 +784,18 @@ static struct raw_neigh* neigh_ring_clone_param(const struct dp_vs_neigh_conf *p
 {
     struct netif_port *port;
     struct raw_neigh* mac_param;
-    port = netif_port_get_by_name(param->ifname);
-    mac_param = rte_zmalloc("mac_entry", sizeof(struct raw_neigh), RTE_CACHE_LINE_SIZE);
-    if (mac_param == NULL)
+
+    mac_param = dpvs_mempool_get(neigh_mempool, sizeof(struct raw_neigh));
+    if (unlikely(mac_param == NULL))
         return NULL;
+    port = netif_port_get_by_name(param->ifname);
     mac_param->af = param->af;
     rte_memcpy(&mac_param->ip_addr, &param->ip_addr, sizeof(union inet_addr));
     mac_param->flag = param->flag | NEIGHBOUR_STATIC;
     mac_param->port = port;
     mac_param->add = add;
     rte_memcpy(&mac_param->eth_addr, &param->eth_addr, 6);
+
     return mac_param;
 }
 
@@ -714,7 +803,7 @@ static struct raw_neigh* neigh_ring_clone_param(const struct dp_vs_neigh_conf *p
  *1, master core static neighbour sync slave core;
  *2, ipv6 slave core sync slave core when recieve ns/na
  */
-void neigh_process_ring(void *arg)
+static void neigh_process_ring(void *arg)
 {
     struct raw_neigh *params[NETIF_MAX_PKT_BURST];
     uint16_t nb_rb;
@@ -722,6 +811,7 @@ void neigh_process_ring(void *arg)
     struct neighbour_entry *neigh;
     struct raw_neigh *param;
     lcoreid_t cid = rte_lcore_id();
+
     nb_rb = rte_ring_dequeue_burst(neigh_ring[cid], (void **)params,
                                    NETIF_MAX_PKT_BURST, NULL);
     if (nb_rb > 0) {
@@ -734,39 +824,43 @@ void neigh_process_ring(void *arg)
            if (param->add) {
                if (neigh) {
                    neigh_edit(neigh, &param->eth_addr);
-                   if (!(param->flag & NEIGHBOUR_STATIC))
-                       neigh_entry_state_trans(neigh, 1);
-               }
-               else {
+               } else {
                    neigh = neigh_add_table(param->af, &param->ip_addr,
                                            &param->eth_addr, param->port,
                                            hash, param->flag);
-                   if (!(param->flag & NEIGHBOUR_STATIC))
-                       neigh_entry_state_trans(neigh, 1);
+                   if (unlikely(!neigh))
+                       goto cont;
                }
-
+               if (!(param->flag & NEIGHBOUR_STATIC))
+                   neigh_entry_state_trans(neigh, 1);
                neigh_send_mbuf_cach(neigh);
-
            } else {
                if (neigh) {
+                   struct neighbour_mbuf_entry *mbuf, *mbuf_next;
                    if (!(neigh->flag & NEIGHBOUR_STATIC))
                        dpvs_timer_cancel(&neigh->timer, false);
                    neigh_unhash(neigh);
-
-                   struct neighbour_mbuf_entry *mbuf, *mbuf_next;
+#ifdef CONFIG_DPVS_NEIGH_DEBUG
+                   {
+                       char buf[512];
+                       dump_neigh_entry(neigh, buf, sizeof(buf));
+                       RTE_LOG(INFO, NEIGHBOUR, "%s:[%02d] del neigh entry: %s\n", __func__, cid, buf);
+                   }
+#endif
                    list_for_each_entry_safe(mbuf, mbuf_next,
                                      &neigh->queue_list, neigh_mbuf_list) {
                        list_del(&mbuf->neigh_mbuf_list);
                        rte_pktmbuf_free(mbuf->m);
-                       rte_free(mbuf);
+                       dpvs_mempool_put(neigh_mempool, mbuf);
                    }
-                   rte_free(neigh);
+                   dpvs_mempool_put(neigh_mempool, neigh);
                    neigh_nums[cid]--;
-               }
-               else
+               } else {
                    RTE_LOG(WARNING, NEIGHBOUR, "%s: not exist\n", __func__);
+               }
            }
-           rte_free(param);
+cont:
+           dpvs_mempool_put(neigh_mempool, param);
        }
     }
 }
@@ -804,7 +898,6 @@ static void neigh_fill_array(struct netif_port *dev, lcoreid_t cid,
                         RTE_LOG(WARNING, NEIGHBOUR, "%s: neigh num not match\n", __func__);
                         break;
                     }
-
                     neigh_fill_param(&array->addrs[off++], entry, cid);
                     array->neigh_nums = off;
                 }
@@ -817,7 +910,6 @@ static void neigh_fill_array(struct netif_port *dev, lcoreid_t cid,
                     RTE_LOG(WARNING, NEIGHBOUR, "%s: neigh num not match\n", __func__);
                     break;
                 }
-
                 neigh_fill_param(&array->addrs[off++], entry, cid);
                 array->neigh_nums = off;
             }
@@ -837,7 +929,10 @@ static int get_neigh_uc_cb(struct dpvs_msg *msg)
 
     len = sizeof(struct dp_vs_neigh_conf_array) +
           sizeof(struct dp_vs_neigh_conf) * neigh_nums[cid];
-    array = rte_zmalloc("neigh_array", len, RTE_CACHE_LINE_SIZE);
+    array = msg_reply_alloc(len);
+    if (unlikely(!array))
+        return EDPVS_NOMEM;
+    array->neigh_nums = 0;
 
     neigh_fill_array(dev, cid, array, neigh_nums[cid]);
     msg->reply.len = len;
@@ -901,7 +996,7 @@ static int neigh_sockopt_get(sockoptid_t opt, const void *conf,
     array->neigh_nums = neigh_nums_g;
     list_for_each_entry(cur, &reply->mq, mq_node) {
         array_msg = (struct dp_vs_neigh_conf_array *)(cur->data);
-        memcpy(&array->addrs[off], &array_msg->addrs,
+        memcpy(&array->addrs[off], &array_msg->addrs[0],
                array_msg->neigh_nums * sizeof(struct dp_vs_neigh_conf));
         off += array_msg->neigh_nums;
     }
@@ -938,7 +1033,7 @@ int neigh_sync_core(const void *param, bool add_del, enum param_kind kind)
                 RTE_LOG(WARNING, NEIGHBOUR, "%s: neigh ring quota exceeded\n",
                 __func__);
             } else if (ret < 0) {
-                rte_free(mac_param);
+                dpvs_mempool_put(neigh_mempool, mac_param);
                 RTE_LOG(WARNING, NEIGHBOUR, "%s: neigh ring enqueue failed\n",
                 __func__);
                 return EDPVS_DPDKAPIFAIL;
@@ -1005,7 +1100,24 @@ static struct dpvs_sockopts neigh_sockopts = {
     .set         = neigh_sockopt_set,
 };
 
-static struct netif_lcore_loop_job neigh_sync_job;
+#define NEIGH_LCORE_JOB_MAX     2
+
+static struct dpvs_lcore_job_array neigh_jobs[NEIGH_LCORE_JOB_MAX] = {
+    [0] = {
+        .role = LCORE_ROLE_FWD_WORKER,
+        .job.name = "neigh_sync",
+        .job.type = LCORE_JOB_SLOW,
+        .job.func = neigh_process_ring,
+        .job.skip_loops = NEIGH_PROCESS_MAC_RING_INTERVAL,
+    },
+
+    [1] = {
+        .role = LCORE_ROLE_MASTER,
+        .job.name = "neigh_sync",
+        .job.type = LCORE_JOB_LOOP,
+        .job.func = neigh_process_ring,
+    }
+};
 
 static int arp_init(void)
 {
@@ -1018,7 +1130,6 @@ static int arp_init(void)
         }
     }
 
-
     master_cid = rte_lcore_id();
 
     arp_pkt_type.type = rte_cpu_to_be_16(ETHER_TYPE_ARP);
@@ -1029,15 +1140,11 @@ static int arp_init(void)
 
     neigh_ring_init();
 
-    /*get static arp entry from master*/
-    snprintf(neigh_sync_job.name, sizeof(neigh_sync_job.name) - 1, "%s", "neigh_sync");
-    neigh_sync_job.func = neigh_process_ring;
-    neigh_sync_job.data = NULL;
-    neigh_sync_job.type = NETIF_LCORE_JOB_SLOW;
-    neigh_sync_job.skip_loops = NEIGH_PROCESS_MAC_RING_INTERVAL;
-    err = netif_lcore_loop_job_register(&neigh_sync_job);
-    if (err != EDPVS_OK)
-        return err;
+    for (i = 0; i < NELEMS(neigh_jobs); i++) {
+        if ((err = dpvs_lcore_job_register(&neigh_jobs[i].job,
+                                           neigh_jobs[i].role)) != EDPVS_OK)
+            return err;
+    }
 
     return EDPVS_OK;
 }
@@ -1047,6 +1154,8 @@ static void register_stats_cb(void)
     struct dpvs_msg_type mt;
     memset(&mt, 0 , sizeof(mt));
     mt.type = MSG_TYPE_NEIGH_GET;
+    mt.prio = MSG_PRIO_LOW;
+    mt.mode   = DPVS_MSG_MULTICAST;
     mt.unicast_msg_cb = get_neigh_uc_cb;
     mt.multicast_msg_cb = NULL;
     assert(msg_type_mc_register(&mt) == 0);
@@ -1057,6 +1166,8 @@ static void unregister_stats_cb(void)
     struct dpvs_msg_type mt;
     memset(&mt, 0, sizeof(mt));
     mt.type = MSG_TYPE_NEIGH_GET;
+    mt.prio = MSG_PRIO_LOW;
+    mt.mode   = DPVS_MSG_MULTICAST;
     mt.unicast_msg_cb = get_neigh_uc_cb;
     mt.multicast_msg_cb = NULL;
     assert(msg_type_mc_unregister(&mt) == 0);
@@ -1064,19 +1175,29 @@ static void unregister_stats_cb(void)
 
 int neigh_init(void)
 {
-    if(EDPVS_NOMEM == arp_init()){
+    /* mempool for "neighbour_entry"(128 bytes), "raw_neigh"(64 byte) and
+     * "neighbour_mbuf_entry"(64 bytes), mempool use 4MB memory in total,
+     * and can provide memory for up to 8K neighbour entries. */
+    neigh_mempool = dpvs_mempool_create("neigh_mempool", 32, 256, 1024);
+    if (!neigh_mempool) {
+        RTE_LOG(ERR, NEIGHBOUR, "%s: fail to create mempool for neigh entry -- %s",
+                __func__, rte_strerror(rte_errno));
         return EDPVS_NOMEM;
     }
 
     register_stats_cb();
 
-    return EDPVS_OK;
+    return arp_init();
 }
 
 int neigh_term(void)
 {
+    int i;
+
     unregister_stats_cb();
+
+    for (i = 0; i < NELEMS(neigh_jobs); i++)
+        dpvs_lcore_job_unregister(&neigh_jobs[i].job, neigh_jobs[i].role);
 
     return EDPVS_OK;
 }
-

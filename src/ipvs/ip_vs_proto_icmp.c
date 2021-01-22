@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -24,7 +24,7 @@
 #include <linux/icmp.h>
 #include <netinet/icmp6.h>
 #include "dpdk.h"
-#include "common.h"
+#include "conf/common.h"
 #include "inet.h"
 #include "ipv4.h"
 #include "ipv6.h"
@@ -81,6 +81,7 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
     void *ich = NULL;
     struct dp_vs_service *svc;
     int af = iph->af;
+    bool outwall = false;
     assert(proto && iph && mbuf && conn && verdict);
 
     if (AF_INET6 == af) {
@@ -98,22 +99,20 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_INVPKT;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto,
-                               &iph->daddr, 0, 0, mbuf, NULL);
+    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, 0, 0, 
+                               mbuf, NULL, &outwall, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
         return EDPVS_NOSERV;
     }
 
     /* schedule RS and create new connection */
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(svc, iph, mbuf, false, outwall);
     if (!*conn) {
-        dp_vs_service_put(svc);
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
     }
 
-    dp_vs_service_put(svc);
     return EDPVS_OK;
 }
 

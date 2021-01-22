@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2018 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -21,7 +21,7 @@
 #include "route6_hlist.h"
 #include "linux_ipv6.h"
 
-#define RT6_HLIST_MAX_BUCKET_BITS   10
+#define RT6_HLIST_MAX_BUCKET_BITS   8
 #define RT6_HLIST_MAX_BUCKETS       (1U<<RT6_HLIST_MAX_BUCKET_BITS)
 
 #define this_rt6_htable     (RTE_PER_LCORE(dpvs_rt6_htable).htable)
@@ -176,7 +176,7 @@ static int rt6_hlist_add_lcore(const struct dp_vs_route6_conf *cf)
 
         nbuckets = rt6_hlist_buckets(cf->dst.plen);
         size = sizeof(struct rt6_hlist) + nbuckets * sizeof(struct list_head);
-        new_hlist = rte_zmalloc_socket("rt6_hlist", size, 0, rte_socket_id());
+        new_hlist = rte_zmalloc("rt6_hlist", size, 0);
         if (unlikely(!new_hlist)) {
             RTE_LOG(ERR, RT6, "[%d] %s: fail to alloc rt6_hlist\n",
                     rte_lcore_id(), __func__);
@@ -201,7 +201,7 @@ static int rt6_hlist_add_lcore(const struct dp_vs_route6_conf *cf)
     }
 
     /* create route6 entry and hash it into current hlist */
-    rt6 = rte_zmalloc_socket("rt6_entry", sizeof(struct route6), 0, rte_socket_id());
+    rt6 = rte_zmalloc("rt6_entry", sizeof(struct route6), 0);
     if (unlikely(!rt6)) {
         RTE_LOG(ERR, RT6, "[%d] %s: fail to alloc rt6_entry!\n",
                 rte_lcore_id(), __func__);
@@ -280,10 +280,6 @@ rt6_hlist_flow_match(const struct route6 *rt6, const struct flow6 *fl6)
     if (fl6->fl6_oif && rt6->rt6_dev && (fl6->fl6_oif->id != rt6->rt6_dev->id))
         return false;
 
-    if ((!ipv6_addr_any(&rt6->rt6_src.addr)) && (ipv6_addr_equal(&rt6->rt6_src.addr,
-                    &fl6->fl6_saddr)) != true)
-        return false;
-
     /* anything else to check ? */
 
     return true;
@@ -338,9 +334,12 @@ static struct dp_vs_route6_conf_array*
 
     *nbytes = sizeof(struct dp_vs_route6_conf_array) +
             g_nroutes * sizeof(struct dp_vs_route6_conf);
-    rt6_arr = rte_zmalloc_socket("rt6_sockopt_get", *nbytes, 0, rte_socket_id());
-    if (unlikely(!rt6_arr))
+    rt6_arr = rte_zmalloc("rt6_sockopt_get", *nbytes, 0);
+    if (unlikely(!rt6_arr)) {
+        RTE_LOG(WARNING, RT6, "%s: rte_zmalloc null.\n",
+            __func__);
         return NULL;
+    }
 
     off = 0;
     list_for_each_entry(hlist, &this_rt6_htable, node) {

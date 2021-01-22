@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -35,12 +35,10 @@ static int dp_vs_rr_update_svc(struct dp_vs_service *svc,
  * Round-Robin Scheduling
  */
 static struct dp_vs_dest *dp_vs_rr_schedule(struct dp_vs_service *svc,
-                                            const struct rte_mbuf *mbuf)
+                    const struct rte_mbuf *mbuf, const struct dp_vs_iphdr *iph __rte_unused)
 {
     struct list_head *p, *q;
     struct dp_vs_dest *dest;
-
-    rte_rwlock_write_lock(&svc->sched_lock);
 
     p = (struct list_head *)svc->sched_data;
     p = p->next;
@@ -59,13 +57,11 @@ static struct dp_vs_dest *dp_vs_rr_schedule(struct dp_vs_service *svc,
             goto out;
         q = q->next;
     } while (q != p);
-    rte_rwlock_write_unlock(&svc->sched_lock);
 
     return NULL;
 
 out:
     svc->sched_data = q;
-    rte_rwlock_write_unlock(&svc->sched_lock);
 
     return dest;
 }

@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2018 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -21,7 +21,7 @@
  * Lei Chen <raychen@qiyi.com>, initial, Jul 2018.
  */
 #include <assert.h>
-#include "common.h"
+#include "conf/common.h"
 #include "dpdk.h"
 #include "inet.h"
 #include "ipv6.h"
@@ -34,13 +34,13 @@ static int ip6_msg_get_stats(struct dpvs_msg *msg)
     struct inet_stats *stats;
     assert(msg);
 
-    stats = rte_zmalloc(NULL, sizeof(*stats), 0);
+    stats = msg_reply_alloc(sizeof(*stats));
     if (!stats)
         return EDPVS_NOMEM;
 
     err = ipv6_stats_cpu(stats);
     if (err != EDPVS_OK) {
-        rte_free(stats);
+        msg_reply_free(stats);
         return err;
     }
 
@@ -107,6 +107,7 @@ static int ip6_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 
 static struct dpvs_msg_type ip6_stats_msg = {
     .type           = MSG_TYPE_IPV6_STATS,
+    .prio           = MSG_PRIO_LOW,
     .unicast_msg_cb = ip6_msg_get_stats,
 };
 

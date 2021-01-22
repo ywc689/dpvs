@@ -1,7 +1,7 @@
 #
 # DPVS is a software load balancer (Virtual Server) based on DPDK.
 #
-# Copyright (C) 2017 iQIYI (www.iqiyi.com).
+# Copyright (C) 2021 iQIYI (www.iqiyi.com).
 # All Rights Reserved.
 #
 # This program is free software; you can redistribute it and/or
@@ -34,8 +34,13 @@ DATE_STRING := $(shell date +%Y.%m.%d.%H:%M:%S)
 # same path of THIS Makefile
 SRCDIR := $(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 
-include $(SRCDIR)/dpdk.mk
+ifeq ($(RTE_SDK),)
+	$(error "The variable RTE_SDK is not defined.")
+endif
+include $(RTE_SDK)/mk/rte.vars.mk
+
 include $(SRCDIR)/config.mk
+include $(SRCDIR)/dpdk.mk
 
 INCDIRS += -I $(SRCDIR)/../include
 
@@ -54,6 +59,7 @@ ifeq ($(DEBUG),)
 	CFLAGS += -O3
 else
 	CFLAGS += -g -O0 -D DEBUG
+	CFLAGS += -rdynamic
 endif
 
 LIBS += -lpthread -lnuma
@@ -66,12 +72,12 @@ OBJS := $(patsubst %.c,%.o,$(OBJS))
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	@$(CC) $(CFLAGS) $^ -o $@
 	@echo "  $(notdir $@)"
+	$(Q)$(CC) $(CFLAGS) $^ -o $@
 
 %.o: %.c
-	@$(CC) -c $(CFLAGS) $< -o $@
 	@echo "  $(notdir $@)"
+	$(Q)$(CC) -c $(CFLAGS) $< -o $@
 
 clean:
 	find $(SRCDIR) -name '*.o' | xargs rm -f

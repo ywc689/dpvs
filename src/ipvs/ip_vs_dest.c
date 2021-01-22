@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -26,67 +26,12 @@
 #include "ipvs/conn.h"
 
 /*
- * locks
- */
-
-static rte_rwlock_t __dp_vs_rs_lock;
-
-
-/*
- * hash table for rs
- */
-#define DP_VS_RTAB_BITS 4
-#define DP_VS_RTAB_SIZE (1 << DP_VS_RTAB_BITS)
-#define DP_VS_RTAB_MASK (DP_VS_RTAB_SIZE - 1)
-
-static struct list_head dp_vs_rtable[DP_VS_RTAB_SIZE];
-
-/*
  * Trash for destinations
  */
 
 struct list_head dp_vs_dest_trash = LIST_HEAD_INIT(dp_vs_dest_trash);
 
-static inline unsigned dp_vs_rs_hashkey(int af,
-                    const union inet_addr *addr,
-                    uint32_t port)
-{
-    register unsigned porth = ntohs(port);
-    uint32_t addr_fold;
-
-    addr_fold = inet_addr_fold(af, addr);
-
-    if (!addr_fold) {
-        RTE_LOG(DEBUG, SERVICE, "%s: IP proto not support.\n", __func__);
-        return 0;
-    }
-
-    return (ntohl(addr_fold) ^ (porth >> DP_VS_RTAB_BITS) ^ porth)
-        & DP_VS_RTAB_MASK;
-}
-
-static int dp_vs_rs_hash(struct dp_vs_dest *dest)
-{
-    unsigned hash;
-    if (!list_empty(&dest->d_list)){
-        return EDPVS_EXIST;
-    }
-    hash = dp_vs_rs_hashkey(dest->af, &dest->addr, dest->port);
-    list_add(&dest->d_list, &dp_vs_rtable[hash]);
-    return EDPVS_OK;
-}
-
-static int dp_vs_rs_unhash(struct dp_vs_dest *dest)
-{
-    if(!list_empty(&dest->d_list)){
-        list_del(&dest->d_list);
-        INIT_LIST_HEAD(&dest->d_list);
-    }
-    return EDPVS_OK;
-}
-
-
-struct dp_vs_dest *dp_vs_lookup_dest(int af,
+struct dp_vs_dest *dp_vs_dest_lookup(int af,
                                      struct dp_vs_service *svc,
                                      const union inet_addr *daddr,
                                      uint16_t dport)
@@ -102,101 +47,37 @@ struct dp_vs_dest *dp_vs_lookup_dest(int af,
     return NULL;
 }
 
-/*
- *  Lookup dest by {svc,addr,port} in the destination trash.
- *  The destination trash is used to hold the destinations that are removed
- *  from the service table but are still referenced by some conn entries.
- *  The reason to add the destination trash is when the dest is temporary
- *  down (either by administrator or by monitor program), the dest can be
- *  picked back from the trash, the remaining connections to the dest can
- *  continue, and the counting information of the dest is also useful for
- *  scheduling.
- */
-struct dp_vs_dest *dp_vs_trash_get_dest(struct dp_vs_service *svc,
-                                        const union inet_addr *daddr,
-                                        uint16_t dport)
-{
-    struct dp_vs_dest *dest, *nxt;
-
-    list_for_each_entry_safe(dest, nxt, &dp_vs_dest_trash, n_list) {
-        RTE_LOG(DEBUG, SERVICE, "%s: Destination still in trash.\n", __func__);
-        if (dest->af == svc->af &&
-            inet_addr_equal(svc->af, &dest->addr, daddr) &&
-            dest->port == dport &&
-            dest->vfwmark == svc->fwmark &&
-            dest->proto == svc->proto &&
-            (svc->fwmark ||
-             (inet_addr_equal(svc->af, &dest->vaddr, &svc->addr) &&
-              dest->vport == svc->port))) {
-             /*since svc may be edit, variables should be coverd*/
-             dest->conn_timeout = svc->conn_timeout;
-             dest->limit_proportion = svc->limit_proportion;
-             return dest;
-            }
-        if (rte_atomic32_read(&dest->refcnt) == 1) {
-            RTE_LOG(DEBUG, SERVICE, "%s: Removing destination from trash.\n", __func__);
-            list_del(&dest->n_list);
-            //dp_vs_dst_reset(dest);//to be finished
-            __dp_vs_unbind_svc(dest);
-
-            dp_vs_del_stats(dest->stats);
-            rte_free(dest);
-        }
-    }
-    return NULL;
-}
-
-void dp_vs_trash_cleanup(void)
-{
-    struct dp_vs_dest *dest, *nxt;
-
-    list_for_each_entry_safe(dest, nxt, &dp_vs_dest_trash, n_list) {
-        list_del(&dest->n_list);
-        //dp_vs_dst_reset(dest);
-        __dp_vs_unbind_svc(dest);
-
-        dp_vs_del_stats(dest->stats);
-        rte_free(dest);
-    }
-}
-
-static void __dp_vs_update_dest(struct dp_vs_service *svc,
+static void __dp_vs_dest_update(struct dp_vs_service *svc,
                                 struct dp_vs_dest *dest,
                                 struct dp_vs_dest_conf *udest)
 {
     int conn_flags;
+    uint8_t num_lcores;
 
+    netif_get_slave_lcores(&num_lcores, NULL);
     rte_atomic16_set(&dest->weight, udest->weight);
     conn_flags = udest->conn_flags | DPVS_CONN_F_INACTIVE;
-
-    rte_rwlock_write_lock(&__dp_vs_rs_lock);
-    dp_vs_rs_hash(dest);
-    rte_rwlock_write_unlock(&__dp_vs_rs_lock);
     rte_atomic16_set(&dest->conn_flags, conn_flags);
 
-    /* bind the service */
-    if (!dest->svc) {
-        __dp_vs_bind_svc(dest, svc);
-    } else {
-        if (dest->svc != svc) {
-            __dp_vs_unbind_svc(dest);
-
-            dp_svc_stats_clear(dest->stats);
-
-            __dp_vs_bind_svc(dest, svc);
-        }
-    }
-
-    dest->flags |= DPVS_DEST_F_AVAILABLE;
+    dp_vs_dest_set_avail(dest);
 
     if (udest->max_conn == 0 || udest->max_conn > dest->max_conn)
         dest->flags &= ~DPVS_DEST_F_OVERLOAD;
-    dest->max_conn = udest->max_conn;
-    dest->min_conn = udest->min_conn;
+    if (rte_lcore_id() != rte_get_master_lcore()) {
+        dest->max_conn = udest->max_conn / num_lcores;
+        dest->min_conn = udest->min_conn / num_lcores;
+    } else {
+        /*
+            Ensure that the sum of rs's max_conn in all lcores is equal to the configured max_conn,
+            to prevent the operation of modifying rs from keepalived when reloading.
+        */
+        dest->max_conn = udest->max_conn % num_lcores;
+        dest->min_conn = udest->min_conn % num_lcores;
+    }
 }
 
 
-int dp_vs_new_dest(struct dp_vs_service *svc,
+int dp_vs_dest_new(struct dp_vs_service *svc,
                    struct dp_vs_dest_conf *udest,
                    struct dp_vs_dest **dest_p)
 {
@@ -223,23 +104,17 @@ int dp_vs_new_dest(struct dp_vs_service *svc,
     rte_atomic32_set(&dest->actconns, 0);
     rte_atomic32_set(&dest->inactconns, 0);
     rte_atomic32_set(&dest->persistconns, 0);
-    rte_atomic32_set(&dest->refcnt, 0);
+    rte_atomic32_set(&dest->refcnt, 1);
+    dp_vs_service_bind(dest, svc);
 
-    INIT_LIST_HEAD(&dest->d_list);
-
-    if (dp_vs_new_stats(&(dest->stats)) != EDPVS_OK) {
-        rte_free(dest);
-        return EDPVS_NOMEM;
-    }
-
-    __dp_vs_update_dest(svc, dest, udest);
+    __dp_vs_dest_update(svc, dest, udest);
 
     *dest_p = dest;
     return EDPVS_OK;
 }
 
 int
-dp_vs_add_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
+dp_vs_dest_add(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
 {
     struct dp_vs_dest *dest;
     union inet_addr daddr;
@@ -262,7 +137,7 @@ dp_vs_add_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
     /*
      * Check if the dest already exists in the list
      */
-    dest = dp_vs_lookup_dest(udest->af, svc, &daddr, dport);
+    dest = dp_vs_dest_lookup(udest->af, svc, &daddr, dport);
 
     if (dest != NULL) {
         RTE_LOG(DEBUG, SERVICE, "%s: dest already exists.\n", __func__);
@@ -270,61 +145,12 @@ dp_vs_add_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
     }
 
     /*
-     * Check if the dest already exists in the trash and
-     * is from the same service
-     */
-    dest = dp_vs_trash_get_dest(svc, &daddr, dport);
-
-    if (dest != NULL) {
-        RTE_LOG(DEBUG, SERVICE, "%s: get dest from trash.\n", __func__);
-
-        __dp_vs_update_dest(svc, dest, udest);
-
-        /*
-         * Get the destination from the trash
-         */
-        list_del(&dest->n_list);
-        /* Reset the statistic value */
-        dp_svc_stats_clear(dest->stats);
-
-        rte_rwlock_write_lock(&__dp_vs_svc_lock);
-
-        /*
-         * Wait until all other svc users go away.
-         */
-        DPVS_WAIT_WHILE(rte_atomic32_read(&svc->usecnt) > 1);
-
-        list_add(&dest->n_list, &svc->dests);
-        svc->weight += udest->weight;
-        svc->num_dests++;
-
-        /* call the update_service function of its scheduler */
-        if (svc->scheduler->update_service)
-            svc->scheduler->update_service(svc, dest, DPVS_SO_SET_ADDDEST);
-
-        rte_rwlock_write_unlock(&__dp_vs_svc_lock);
-        return EDPVS_OK;
-    }
-
-    /*
      * Allocate and initialize the dest structure
      */
-    ret = dp_vs_new_dest(svc, udest, &dest);
+    ret = dp_vs_dest_new(svc, udest, &dest);
     if (ret) {
         return ret;
     }
-
-    /*
-     * Add the dest entry into the list
-     */
-    rte_atomic32_inc(&dest->refcnt);
-
-    rte_rwlock_write_lock(&__dp_vs_svc_lock);
-
-    /*
-     * Wait until all other svc users go away.
-     */
-    DPVS_WAIT_WHILE(rte_atomic32_read(&svc->usecnt) > 1);
 
     list_add(&dest->n_list, &svc->dests);
     svc->weight += udest->weight;
@@ -334,13 +160,11 @@ dp_vs_add_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
     if (svc->scheduler->update_service)
         svc->scheduler->update_service(svc, dest, DPVS_SO_SET_ADDDEST);
 
-    rte_rwlock_write_unlock(&__dp_vs_svc_lock);
-
     return EDPVS_OK;
 }
 
 int
-dp_vs_edit_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
+dp_vs_dest_edit(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
 {
     struct dp_vs_dest *dest;
     union inet_addr daddr;
@@ -363,7 +187,7 @@ dp_vs_edit_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
     /*
      *  Lookup the destination list
      */
-    dest = dp_vs_lookup_dest(udest->af, svc, &daddr, dport);
+    dest = dp_vs_dest_lookup(udest->af, svc, &daddr, dport);
 
     if (dest == NULL) {
         RTE_LOG(DEBUG, SERVICE,"%s(): dest doesn't exist\n", __func__);
@@ -373,12 +197,7 @@ dp_vs_edit_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
     /* Save old weight */
     old_weight = rte_atomic16_read(&dest->weight);
 
-    __dp_vs_update_dest(svc, dest, udest);
-
-    rte_rwlock_write_lock(&__dp_vs_svc_lock);
-
-    /* Wait until all other svc users go away */
-    DPVS_WAIT_WHILE(rte_atomic32_read(&svc->usecnt) > 1);
+    __dp_vs_dest_update(svc, dest, udest);
 
     /* Update service weight */
     svc->weight = svc->weight - old_weight + udest->weight;
@@ -395,53 +214,27 @@ dp_vs_edit_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
     if (svc->scheduler->update_service)
         svc->scheduler->update_service(svc, dest, DPVS_SO_SET_EDITDEST);
 
-    rte_rwlock_write_unlock(&__dp_vs_svc_lock);
-
     return EDPVS_OK;
 }
 
-/*
- *  Delete a destination (must be already unlinked from the service)
- */
-void __dp_vs_del_dest(struct dp_vs_dest *dest)
+void dp_vs_dest_put(struct dp_vs_dest *dest)
 {
-    /*
-     *  Remove it from the d-linked list with the real services.
-     */
-    rte_rwlock_write_lock(&__dp_vs_rs_lock);
-    dp_vs_rs_unhash(dest);
-    rte_rwlock_write_unlock(&__dp_vs_rs_lock);
+    if (!dest)
+        return;
 
-    /*
-     *  Decrease the refcnt of the dest, and free the dest
-     *  if nobody refers to it (refcnt=0). Otherwise, throw
-     *  the destination into the trash.
-     */
     if (rte_atomic32_dec_and_test(&dest->refcnt)) {
-     //   dp_vs_dst_reset(dest);
-        /* simply decrease svc->refcnt here, let the caller check
-           and release the service if nobody refers to it.
-           Only user context can release destination and service,
-           and only one user context can update virtual service at a
-           time, so the operation here is OK */
-        rte_atomic32_dec(&dest->svc->refcnt);
-        dest->svc = NULL;
-        dp_vs_del_stats(dest->stats);
+        dp_vs_service_unbind(dest);
         rte_free(dest);
-    } else {
-        RTE_LOG(DEBUG, SERVICE,"%s moving dest into trash\n", __func__);
-        list_add(&dest->n_list, &dp_vs_dest_trash);
-        rte_atomic32_inc(&dest->refcnt);
     }
 }
 
 /*
  *  Unlink a destination from the given service
  */
-void __dp_vs_unlink_dest(struct dp_vs_service *svc,
+void dp_vs_dest_unlink(struct dp_vs_service *svc,
                 struct dp_vs_dest *dest, int svcupd)
 {
-    dest->flags &= ~DPVS_DEST_F_AVAILABLE;
+    dp_vs_dest_clear_avail(dest);
 
     /*
      *  Remove it from the d-linked destination list.
@@ -467,42 +260,32 @@ void __dp_vs_unlink_dest(struct dp_vs_service *svc,
 }
 
 int
-dp_vs_del_dest(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
+dp_vs_dest_del(struct dp_vs_service *svc, struct dp_vs_dest_conf *udest)
 {
     struct dp_vs_dest *dest;
     uint16_t dport = udest->port;
 
-    dest = dp_vs_lookup_dest(udest->af, svc, &udest->addr, dport);
+    dest = dp_vs_dest_lookup(udest->af, svc, &udest->addr, dport);
 
     if (dest == NULL) {
         RTE_LOG(DEBUG, SERVICE,"%s(): destination not found!\n", __func__);
         return EDPVS_NOTEXIST;
     }
 
-    rte_rwlock_write_lock(&__dp_vs_svc_lock);
-
-    /*
-     *      Wait until all other svc users go away.
-     */
-    DPVS_WAIT_WHILE(rte_atomic32_read(&svc->usecnt) > 1);
-
     /*
      *      Unlink dest from the service
      */
-    __dp_vs_unlink_dest(svc, dest, 1);
-
-    rte_rwlock_write_unlock(&__dp_vs_svc_lock);
+    dp_vs_dest_unlink(svc, dest, 1);
 
     /*
      *      Delete the destination
      */
-    __dp_vs_del_dest(dest);
+    dp_vs_dest_put(dest);
 
     return EDPVS_OK;
 }
 
-int dp_vs_get_dest_entries(const struct dp_vs_service *svc,
-                           const struct dp_vs_get_dests *get,
+int dp_vs_dest_get_entries(const struct dp_vs_service *svc,
                            struct dp_vs_get_dests *uptr)
 {
     int ret = 0;
@@ -510,8 +293,10 @@ int dp_vs_get_dest_entries(const struct dp_vs_service *svc,
     struct dp_vs_dest *dest;
     struct dp_vs_dest_entry entry;
 
+    uptr->cid = rte_lcore_id();
+    uptr->num_dests = svc->num_dests;
     list_for_each_entry(dest, &svc->dests, n_list){
-        if(count >= get->num_dests)
+        if(count >= svc->num_dests)
             break;
         memset(&entry, 0, sizeof(entry));
         entry.af   = dest->af;
@@ -524,7 +309,7 @@ int dp_vs_get_dest_entries(const struct dp_vs_service *svc,
         entry.actconns = rte_atomic32_read(&dest->actconns);
         entry.inactconns = rte_atomic32_read(&dest->inactconns);
         entry.persistconns = rte_atomic32_read(&dest->persistconns);
-        ret = dp_vs_copy_stats(&(entry.stats), dest->stats);
+        ret = dp_vs_stats_add(&(entry.stats), &dest->stats);
         if (ret != EDPVS_OK)
             break;
 
@@ -537,16 +322,10 @@ int dp_vs_get_dest_entries(const struct dp_vs_service *svc,
 
 int dp_vs_dest_init(void)
 {
-    int idx;
-    for (idx = 0; idx < DP_VS_RTAB_SIZE; idx++) {
-        INIT_LIST_HEAD(&dp_vs_rtable[idx]);
-    }
-    rte_rwlock_init(&__dp_vs_rs_lock);
     return EDPVS_OK;
 }
 
 int dp_vs_dest_term(void)
 {
-    dp_vs_trash_cleanup();
     return EDPVS_OK;
 }

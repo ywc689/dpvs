@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -18,7 +18,7 @@
 #include <assert.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
-#include "common.h"
+#include "conf/common.h"
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
@@ -150,6 +150,7 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
 {
     struct udp_hdr *uh, _udph;
     struct dp_vs_service *svc;
+    bool outwall = false;
     assert(proto && iph && mbuf && conn && verdict);
 
     uh = mbuf_header_pointer(mbuf, iph->len, sizeof(_udph), &_udph);
@@ -159,17 +160,16 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
     }
 
     /* lookup service <vip:vport> */
-    svc = dp_vs_service_lookup(iph->af, iph->proto,
-                               &iph->daddr, uh->dst_port, 0, mbuf, NULL);
+    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, 
+                     uh->dst_port, 0, mbuf, NULL, &outwall, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
         return EDPVS_NOSERV;
     }
 
     /* schedule RS and create new connection */
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(svc, iph, mbuf, false, outwall);
     if (!*conn) {
-        dp_vs_service_put(svc);
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
     }
@@ -189,7 +189,6 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
         }
     }
 
-    dp_vs_service_put(svc);
     return EDPVS_OK;
 }
 
@@ -207,8 +206,8 @@ udp_conn_lookup(struct dp_vs_proto *proto,
     if (unlikely(!uh))
         return NULL;
 
-    if (dp_vs_blklst_lookup(iph->proto, &iph->daddr, uh->dst_port,
-                            &iph->saddr)) {
+    if (dp_vs_blklst_lookup(iph->af, iph->proto, &iph->daddr,
+                uh->dst_port, &iph->saddr)) {
         *drop = true;
         return NULL;
     }
@@ -250,11 +249,18 @@ static int udp_conn_expire(struct dp_vs_proto *proto, struct dp_vs_conn *conn)
     return EDPVS_OK;
 }
 
+static int udp_conn_expire_quiescent(struct dp_vs_conn *conn)
+{
+    dp_vs_conn_expire_now(conn);
+
+    return EDPVS_OK;
+}
+
 static int udp_state_trans(struct dp_vs_proto *proto, struct dp_vs_conn *conn,
                            struct rte_mbuf *mbuf, int dir)
 {
     conn->state = DPVS_UDP_S_NORMAL;
-    conn->timeout.tv_sec = udp_timeouts[conn->state];
+    dp_vs_conn_set_timeout(conn, proto);
     return EDPVS_OK;
 }
 
@@ -281,6 +287,7 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     mbuf = rte_pktmbuf_alloc(ombuf->pool);
     if (unlikely(!mbuf))
         return EDPVS_NOMEM;
+    mbuf->userdata = NULL;
 
     int ipolen_uoa = (AF_INET6 == iaf) ? IPOLEN_UOA_IPV6 : IPOLEN_UOA_IPV4;
 
@@ -779,19 +786,21 @@ static int udp_snat_out_handler(struct dp_vs_proto *proto,
 }
 
 struct dp_vs_proto dp_vs_proto_udp = {
-    .name               = "UDP",
-    .proto              = IPPROTO_UDP,
-    .conn_sched         = udp_conn_sched,
-    .conn_lookup        = udp_conn_lookup,
-    .conn_expire        = udp_conn_expire,
-    .state_trans        = udp_state_trans,
-    .nat_in_handler     = udp_snat_in_handler,
-    .nat_out_handler    = udp_snat_out_handler,
-    .fnat_in_handler    = udp_fnat_in_handler,
-    .fnat_out_handler   = udp_fnat_out_handler,
-    .fnat_in_pre_handler= udp_fnat_in_pre_handler,
-    .snat_in_handler    = udp_snat_in_handler,
-    .snat_out_handler   = udp_snat_out_handler,
+    .name                  = "UDP",
+    .proto                 = IPPROTO_UDP,
+    .timeout_table         = udp_timeouts,
+    .conn_sched            = udp_conn_sched,
+    .conn_lookup           = udp_conn_lookup,
+    .conn_expire           = udp_conn_expire,
+    .conn_expire_quiescent = udp_conn_expire_quiescent,
+    .state_trans           = udp_state_trans,
+    .nat_in_handler        = udp_snat_in_handler,
+    .nat_out_handler       = udp_snat_out_handler,
+    .fnat_in_handler       = udp_fnat_in_handler,
+    .fnat_out_handler      = udp_fnat_out_handler,
+    .fnat_in_pre_handler   = udp_fnat_in_pre_handler,
+    .snat_in_handler       = udp_snat_in_handler,
+    .snat_out_handler      = udp_snat_out_handler,
 };
 
 static void defence_udp_drop_handler(vector_t tokens)

@@ -1,6 +1,21 @@
+/*
+ * DPVS is a software load balancer (Virtual Server) based on DPDK.
+ *
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
+ * All Rights Reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
 #include "toa.h"
-#include <linux/list.h>
-
 /*
  *    TOA: Address is a new TCP Option
  *    Address include ip+port, Now support IPV4 and IPV6
@@ -62,10 +77,19 @@ static struct toa_ip6_sk_lock toa_ip6_sk_lock;
 static struct proto_ops *inet6_stream_ops_p = NULL;
 static struct inet_connection_sock_af_ops *ipv6_specific_p = NULL;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,1)
+typedef struct sock *(*syn_recv_sock_func_pt)(
+        const struct sock *sk, struct sk_buff *skb,
+        struct request_sock *req,
+        struct dst_entry *dst,
+        struct request_sock *req_unhash,
+        bool *own_req);
+#else
 typedef struct sock *(*syn_recv_sock_func_pt)(
         struct sock *sk, struct sk_buff *skb,
         struct request_sock *req,
         struct dst_entry *dst);
+#endif
 static syn_recv_sock_func_pt tcp_v6_syn_recv_sock_org_pt = NULL;
 #endif
 
@@ -85,6 +109,36 @@ struct toa_stats_entry toa_stats[] = {
 #endif
     TOA_STAT_END
 };
+
+unsigned int is_ro_addr(unsigned long addr)
+{
+    unsigned int level;
+    unsigned int ro_enable = 1;
+    pte_t *pte = lookup_address(addr, &level);
+    if (pte->pte & _PAGE_RW)
+    {
+            ro_enable = 0;
+    }
+    
+    return ro_enable;
+}
+
+void set_addr_rw(unsigned long addr)
+{
+    unsigned int level;
+    pte_t *pte = lookup_address(addr, &level);
+
+    pte->pte |= _PAGE_RW;
+    smp_wmb();
+}
+
+void set_addr_ro(unsigned long addr)
+{
+    unsigned int level;
+    pte_t *pte = lookup_address(addr, &level);
+
+    pte->pte &= ~_PAGE_RW;
+}
 
 DEFINE_TOA_STAT(struct toa_stat_mib, ext_stats);
 
@@ -398,9 +452,15 @@ static void *get_toa_data(int af, struct sk_buff *skb, int *nat64)
  *  try to get local address
  * @return return what the original inet_getname() returns.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,1)
+static int
+inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
+        int peer)
+#else
 static int
 inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
         int *uaddr_len, int peer)
+#endif
 {
     int retval = 0;
     struct sock *sk = sock->sk;
@@ -411,10 +471,14 @@ inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
         sk->sk_user_data);
 
     /* call orginal one */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,1)
+    retval = inet_getname(sock, uaddr, peer);
+#else
     retval = inet_getname(sock, uaddr, uaddr_len, peer);
+#endif
 
     /* set our value if need */
-    if (retval == 0 && NULL != sk->sk_user_data && peer) {
+    if (retval >= 0 && NULL != sk->sk_user_data && peer) {
         if (sk_data_ready_addr == (unsigned long) sk->sk_data_ready &&
             !sock_flag(sk, SOCK_NAT64)) {
             memcpy(&tdata, &sk->sk_user_data, sizeof(tdata));
@@ -553,9 +617,15 @@ out:
 #endif
 
 #ifdef TOA_IPV6_ENABLE
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,1)
+static int
+inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr,
+          int peer)
+#else
 static int
 inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr,
           int *uaddr_len, int peer)
+#endif
 {
     int retval = 0;
     struct sock *sk = sock->sk;
@@ -565,12 +635,16 @@ inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr,
         sk->sk_user_data);
 
     /* call orginal one */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,1)
+    retval = inet6_getname(sock, uaddr, peer);
+#else
     retval = inet6_getname(sock, uaddr, uaddr_len, peer);
+#endif
 
     /* set our value if need */
     lock_cpu_toa_ip6_sk();
 
-    if (retval == 0 && NULL != sk->sk_user_data && peer) {
+    if (retval >= 0 && NULL != sk->sk_user_data && peer) {
         if (sk_data_ready_addr == (unsigned long) sk->sk_data_ready) {
             struct toa_ip6_entry* ptr_ip6_entry  = sk->sk_user_data;
             struct toa_ip6_data* ptr_ip6_data = &ptr_ip6_entry->toa_data;
@@ -642,9 +716,18 @@ get_kernel_ipv6_symbol(void)
  * @param dst [out] route cache entry
  * @return NULL if fail new socket if succeed.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,1)
+static struct sock *
+tcp_v4_syn_recv_sock_toa(const struct sock *sk, struct sk_buff *skb,
+            struct request_sock *req,
+            struct dst_entry *dst,
+            struct request_sock *req_unhash,
+            bool *own_req)
+#else
 static struct sock *
 tcp_v4_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
             struct request_sock *req, struct dst_entry *dst)
+#endif
 {
     struct sock *newsock = NULL;
     int nat64 = 0;
@@ -652,7 +735,11 @@ tcp_v4_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
     TOA_DBG("tcp_v4_syn_recv_sock_toa called\n");
 
     /* call orginal one */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,1)
+    newsock = tcp_v4_syn_recv_sock(sk, skb, req, dst, req_unhash, own_req);
+#else
     newsock = tcp_v4_syn_recv_sock(sk, skb, req, dst);
+#endif
 
     /* set our value if need */
     if (NULL != newsock && NULL == newsock->sk_user_data) {
@@ -683,9 +770,18 @@ tcp_v4_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
 }
 
 #ifdef TOA_IPV6_ENABLE
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,1)
+static struct sock *
+tcp_v6_syn_recv_sock_toa(const struct sock *sk, struct sk_buff *skb,
+             struct request_sock *req,
+             struct dst_entry *dst,
+             struct request_sock *req_unhash,
+             bool *own_req)
+#else
 static struct sock *
 tcp_v6_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
              struct request_sock *req, struct dst_entry *dst)
+#endif
 {
     struct sock *newsock = NULL;
     int nat64 = 0;
@@ -693,7 +789,12 @@ tcp_v6_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
     TOA_DBG("tcp_v6_syn_recv_sock_toa called\n");
 
     /* call orginal one */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,1)
+    newsock = tcp_v6_syn_recv_sock_org_pt(sk, skb, req, dst, req_unhash,
+            own_req);
+#else
     newsock = tcp_v6_syn_recv_sock_org_pt(sk, skb, req, dst);
+#endif
 
     /* set our value if need */
     if (NULL != newsock && NULL == newsock->sk_user_data) {
@@ -726,31 +827,65 @@ tcp_v6_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
 static inline int
 hook_toa_functions(void)
 {
+
+    struct proto_ops *inet_stream_ops_p;
+    struct inet_connection_sock_af_ops *ipv4_specific_p;
+    int rw_enable = 0;
+    
     /* hook inet_getname for ipv4 */
-    struct proto_ops *inet_stream_ops_p =
-            (struct proto_ops *)&inet_stream_ops;
-    /* hook tcp_v4_syn_recv_sock for ipv4 */
-    struct inet_connection_sock_af_ops *ipv4_specific_p =
-            (struct inet_connection_sock_af_ops *)&ipv4_specific;
-
+    inet_stream_ops_p = (struct proto_ops *)&inet_stream_ops;
+    
+    if (is_ro_addr((unsigned long)(&inet_stream_ops.getname))) {
+            set_addr_rw((unsigned long)(&inet_stream_ops.getname));
+            rw_enable = 1;
+    }
     inet_stream_ops_p->getname = inet_getname_toa;
+    if (rw_enable == 1) {
+            set_addr_ro((unsigned long)(&inet_stream_ops.getname));
+            rw_enable = 0;
+    }
     TOA_INFO("CPU [%u] hooked inet_getname <%p> --> <%p>\n",
-        smp_processor_id(), inet_getname, inet_stream_ops_p->getname);
-
+            smp_processor_id(), inet_getname, inet_stream_ops_p->getname);
+    
+    ipv4_specific_p = (struct inet_connection_sock_af_ops *)&ipv4_specific;
+    
+    if (is_ro_addr((unsigned long)(&ipv4_specific.syn_recv_sock))) {
+            set_addr_rw((unsigned long)(&ipv4_specific.syn_recv_sock));
+            rw_enable = 1;
+    }
     ipv4_specific_p->syn_recv_sock = tcp_v4_syn_recv_sock_toa;
+    if (rw_enable == 1) {
+            set_addr_ro((unsigned long)(&ipv4_specific.syn_recv_sock));
+            rw_enable = 0;
+    }
     TOA_INFO("CPU [%u] hooked tcp_v4_syn_recv_sock <%p> --> <%p>\n",
-        smp_processor_id(), tcp_v4_syn_recv_sock,
-        ipv4_specific_p->syn_recv_sock);
-
+            smp_processor_id(), tcp_v4_syn_recv_sock,
+            ipv4_specific_p->syn_recv_sock);
 #ifdef TOA_IPV6_ENABLE
+    if (is_ro_addr((unsigned long)(&inet6_stream_ops_p->getname))) {
+            set_addr_rw((unsigned long)(&inet6_stream_ops_p->getname));
+            rw_enable = 1;
+    }
     inet6_stream_ops_p->getname = inet6_getname_toa;
+    if (rw_enable == 1) {
+            set_addr_ro((unsigned long)(&inet6_stream_ops_p->getname));
+            rw_enable = 0;
+    }
     TOA_INFO("CPU [%u] hooked inet6_getname <%p> --> <%p>\n",
-        smp_processor_id(), inet6_getname, inet6_stream_ops_p->getname);
+            smp_processor_id(), inet6_getname, inet6_stream_ops_p->getname);
 
+    if (is_ro_addr((unsigned long)(&ipv6_specific_p->syn_recv_sock))) {
+            set_addr_rw((unsigned long)(&ipv6_specific_p->syn_recv_sock));
+            rw_enable = 1;
+    }
     ipv6_specific_p->syn_recv_sock = tcp_v6_syn_recv_sock_toa;
+    if (rw_enable == 1) {
+            set_addr_ro((unsigned long)(&ipv6_specific_p->syn_recv_sock));
+            rw_enable = 0;
+    }
     TOA_INFO("CPU [%u] hooked tcp_v6_syn_recv_sock <%p> --> <%p>\n",
-        smp_processor_id(), tcp_v6_syn_recv_sock_org_pt,
-        ipv6_specific_p->syn_recv_sock);
+            smp_processor_id(), tcp_v6_syn_recv_sock_org_pt,
+            ipv6_specific_p->syn_recv_sock);
 #endif
 
     return 0;
@@ -760,31 +895,64 @@ hook_toa_functions(void)
 static int
 unhook_toa_functions(void)
 {
+
+    struct proto_ops *inet_stream_ops_p;
+    struct inet_connection_sock_af_ops *ipv4_specific_p;
+    int rw_enable = 0;
+    
     /* unhook inet_getname for ipv4 */
-    struct proto_ops *inet_stream_ops_p =
-            (struct proto_ops *)&inet_stream_ops;
-    /* unhook tcp_v4_syn_recv_sock for ipv4 */
-    struct inet_connection_sock_af_ops *ipv4_specific_p =
-            (struct inet_connection_sock_af_ops *)&ipv4_specific;
-
+    inet_stream_ops_p = (struct proto_ops *)&inet_stream_ops;
+    
+    if (is_ro_addr((unsigned long)(&inet_stream_ops.getname))) {
+            set_addr_rw((unsigned long)(&inet_stream_ops.getname));
+            rw_enable = 1;
+    }
     inet_stream_ops_p->getname = inet_getname;
-    TOA_INFO("CPU [%u] unhooked inet_getname\n",
-        smp_processor_id());
-
+    if (rw_enable == 1) {
+            set_addr_ro((unsigned long)(&inet_stream_ops.getname));
+            rw_enable = 0;
+    }
+    TOA_INFO("CPU [%u] unhooked inet_getname\n", smp_processor_id());
+    
+    /* unhook tcp_v4_syn_recv_sock for ipv4 */
+    ipv4_specific_p = (struct inet_connection_sock_af_ops *)&ipv4_specific;
+    if (is_ro_addr((unsigned long)(&ipv4_specific.syn_recv_sock))) {
+            set_addr_rw((unsigned long)(&ipv4_specific.syn_recv_sock));
+            rw_enable = 1;
+    }
+    set_addr_rw((unsigned long)(&ipv4_specific.syn_recv_sock));
     ipv4_specific_p->syn_recv_sock = tcp_v4_syn_recv_sock;
-    TOA_INFO("CPU [%u] unhooked tcp_v4_syn_recv_sock\n",
-        smp_processor_id());
+    if (rw_enable == 1) {
+            set_addr_ro((unsigned long)(&ipv4_specific.syn_recv_sock));
+            rw_enable = 0;
+    }
+
+    TOA_INFO("CPU [%u] unhooked tcp_v4_syn_recv_sock\n", smp_processor_id());
 
 #ifdef TOA_IPV6_ENABLE
     if (inet6_stream_ops_p) {
-        inet6_stream_ops_p->getname = inet6_getname;
-        TOA_INFO("CPU [%u] unhooked inet6_getname\n",
-            smp_processor_id());
+            if (is_ro_addr((unsigned long)(&inet6_stream_ops_p->getname))) {
+                    set_addr_rw((unsigned long)(&inet6_stream_ops_p->getname));
+                    rw_enable = 1;
+            }
+            inet6_stream_ops_p->getname = inet6_getname;
+            if (rw_enable == 1) {
+                    set_addr_ro((unsigned long)(&inet6_stream_ops_p->getname));
+                    rw_enable = 0;
+            }
+            TOA_INFO("CPU [%u] unhooked inet6_getname\n", smp_processor_id());
     }
     if (ipv6_specific_p) {
-        ipv6_specific_p->syn_recv_sock = tcp_v6_syn_recv_sock_org_pt;
-        TOA_INFO("CPU [%u] unhooked tcp_v6_syn_recv_sock\n",
-            smp_processor_id());
+            if (is_ro_addr((unsigned long)(&ipv6_specific_p->syn_recv_sock))) {
+                    set_addr_rw((unsigned long)(&ipv6_specific_p->syn_recv_sock));
+                    rw_enable = 1;
+            }
+            ipv6_specific_p->syn_recv_sock = tcp_v6_syn_recv_sock_org_pt;
+            if (rw_enable == 1) {
+                    set_addr_ro((unsigned long)(&ipv6_specific_p->syn_recv_sock));
+                    rw_enable = 0;
+            }
+            TOA_INFO("CPU [%u] unhooked tcp_v6_syn_recv_sock\n", smp_processor_id());
     }
 #endif
 

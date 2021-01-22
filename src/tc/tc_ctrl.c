@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -60,7 +60,7 @@ static int fill_qsch_param(struct Qsch *sch, struct tc_qsch_param *pr)
     /* handle replies */
     list_for_each_entry(reply, &replies->mq, mq_node) {
         st = (struct tc_qsch_stats *)reply->data;
-        assert(st && reply->cid < RTE_MAX_LCORE);
+        assert(st && reply->cid < DPVS_MAX_LCORE);
 
         pr->qstats_cpus[reply->cid] = st->qstats;
         pr->bstats_cpus[reply->cid] = st->bstats;
@@ -98,7 +98,7 @@ static int fill_cls_param(struct tc_cls *cls, struct tc_cls_param *pr)
 }
 
 /* with tc->lock */
-static int __tc_so_qsch_set(struct netif_tc *tc, tc_oper_t oper,
+static int __tc_so_qsch_set(struct netif_tc *tc, sockoptid_t oper,
                             const struct tc_qsch_param *qpar)
 {
     struct Qsch *sch = NULL;
@@ -147,7 +147,7 @@ static int __tc_so_qsch_set(struct netif_tc *tc, tc_oper_t oper,
 }
 
 /* with tc->lock */
-static int __tc_so_qsch_get(struct netif_tc *tc, tc_oper_t oper,
+static int __tc_so_qsch_get(struct netif_tc *tc, sockoptid_t oper,
                             const struct tc_qsch_param *qpar,
                             union tc_param **arr, int *narr)
 {
@@ -220,7 +220,7 @@ errout:
 }
 
 /* with tc->lock */
-static int __tc_so_cls_set(struct netif_tc *tc, tc_oper_t oper,
+static int __tc_so_cls_set(struct netif_tc *tc, sockoptid_t oper,
                            const struct tc_cls_param *cpar)
 {
     struct Qsch *sch;
@@ -264,7 +264,7 @@ static int __tc_so_cls_set(struct netif_tc *tc, tc_oper_t oper,
 }
 
 /* with tc->lock */
-static int __tc_so_cls_get(struct netif_tc *tc, tc_oper_t oper,
+static int __tc_so_cls_get(struct netif_tc *tc, sockoptid_t oper,
                            const struct tc_cls_param *cpar,
                            union tc_param **arr, int *narr)
 {
@@ -414,7 +414,7 @@ static int tc_msg_get_stats(struct dpvs_msg *msg)
     ptr = msg->data;
     qsch = *(struct Qsch **)ptr;
 
-    st = rte_zmalloc(NULL, sizeof(*st), 0);
+    st = msg_reply_alloc(sizeof(*st));
     if (!st)
         return EDPVS_NOMEM;
 
@@ -429,6 +429,7 @@ static int tc_msg_get_stats(struct dpvs_msg *msg)
 
 static struct dpvs_msg_type tc_stats_msg = {
     .type           = MSG_TYPE_TC_STATS,
+    .prio           = MSG_PRIO_LOW,
     .unicast_msg_cb = tc_msg_get_stats,
 };
 

@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -23,7 +23,7 @@
 #include <arpa/inet.h>
 #include "dpip.h"
 #include "list.h"
-#include "common.h"
+#include "conf/common.h"
 
 static struct list_head dpip_objs = LIST_HEAD_INIT(dpip_objs);
 
@@ -34,8 +34,8 @@ static void usage(void)
         "    "DPIP_NAME" [OPTIONS] OBJECT { COMMAND | help }\n"
         "Parameters:\n"
         "    OBJECT  := { link | addr | route | neigh | vlan | tunnel |\n"
-        "                 qsch | cls | ipv6 }\n"
-        "    COMMAND := { add | del | change | replace | show | flush }\n"
+        "                 qsch | cls | ipv6 | iftraf | eal-mem }\n"
+        "    COMMAND := { add | del | change | replace | show | flush | enable | disable }\n"
         "Options:\n"
         "    -v, --verbose\n"
         "    -h, --help\n"
@@ -152,9 +152,11 @@ static int parse_args(int argc, char *argv[], struct dpip_conf *conf)
         exit(1);
     }
 
-    if (strcmp(argv[1], "add") == 0)
+    if (strcmp(argv[1], "add") == 0 ||
+            strcmp(argv[1], "enable") == 0)
         conf->cmd = DPIP_CMD_ADD;
-    else if (strcmp(argv[1], "del") == 0)
+    else if (strcmp(argv[1], "del") == 0 ||
+            strcmp(argv[1], "disable") == 0)
         conf->cmd = DPIP_CMD_DEL;
     else if (strcmp(argv[1], "set") == 0 ||
              strcmp(argv[1], "change") == 0)

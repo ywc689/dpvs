@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -23,7 +23,7 @@
 #ifndef __DPVS_VLAN_H__
 #define __DPVS_VLAN_H__
 #include <linux/if_ether.h>
-#include "common.h"
+#include "conf/common.h"
 #include "list.h"
 #include "netif.h"
 
@@ -74,7 +74,7 @@ struct vlan_dev_priv {
 
     /* per-CPU statistics
      * RTE_DEFINE_PER_LCORE cannot be used inside struct */
-    struct vlan_stats   lcore_stats[RTE_MAX_LCORE];
+    struct vlan_stats   lcore_stats[DPVS_MAX_LCORE];
 };
 
 /**
