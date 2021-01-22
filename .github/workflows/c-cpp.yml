@@ -6,16 +6,29 @@ on:
   pull_request:
     branches: [ master ]
   workflow_dispatch:
-  
 
 jobs:
-  build:
+  build-basic:
     runs-on: self-hosted
     env:
       RTE_SDK: /usr/share/dpdk
       RTE_TARGET: x86_64-native-linuxapp-gcc
     steps:
     - uses: actions/checkout@v2
+    - name: make
+      run: make
+    - name: make install
+      run: make install
+      
+  build-debug:
+    runs-on: self-hosted
+    env:
+      RTE_SDK: /usr/share/dpdk
+      RTE_TARGET: x86_64-native-linuxapp-gcc
+    steps:
+    - uses: actions/checkout@v2
+    - name: config
+      run: sed -i 's/#CFLAGS +=/CFLAGS +=/' src/config.mk && sed -i 's/^#DEBUG := 1/DEBUG := 1/' src/Makefile
     - name: make
       run: make
     - name: make install
