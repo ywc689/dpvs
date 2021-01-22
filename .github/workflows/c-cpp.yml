@@ -1,0 +1,22 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+  
+
+jobs:
+  build:
+    runs-on: self-hosted
+    env:
+      RTE_SDK: /usr/share/dpdk
+      RTE_TARGET: x86_64-native-linuxapp-gcc
+    steps:
+    - uses: actions/checkout@v2
+    - name: make
+      run: make
+    - name: make install
+      run: make install
