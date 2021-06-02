@@ -229,7 +229,6 @@ udp_conn_lookup(struct dp_vs_proto *proto,
      * UDP has no ack, we don't know pkt from client is response or not
      * UDP can only confirm neighbour to RS
      */
-    int af = iph->af;
     if (conn != NULL) {
         if ((*direct == DPVS_CONN_DIR_OUTBOUND) && conn->in_dev
              && (!inet_is_addr_any(tuplehash_out(conn).af, &conn->in_nexthop))) {
@@ -299,8 +298,6 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     MBUF_USERDATA(mbuf, void *, MBUF_FIELD_ROUTE) = NULL;
 
     int ipolen_uoa = (AF_INET6 == iaf) ? IPOLEN_UOA_IPV6 : IPOLEN_UOA_IPV4;
-
-    int ipolen_uoa = (AF_INET6 == af) ? IPOLEN_UOA_IPV6 : IPOLEN_UOA_IPV4;
 
     /* don't copy any ip options from oiph, is it ok ? */
     if (AF_INET6 == oaf) {

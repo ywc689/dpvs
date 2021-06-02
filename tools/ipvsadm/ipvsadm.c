@@ -1945,7 +1945,6 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format, lcoreid_t cid
 			if (strlen(se->user.oifname))
 				left -= snprintf(svc_name + strlen(svc_name), left,
 				",oif=%s", se->user.oifname);
->>>>>>> wencyu/dpdk2011-rebase
 		}
 	}
 

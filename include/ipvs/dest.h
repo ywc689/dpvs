@@ -62,7 +62,6 @@ struct dp_vs_dest {
     unsigned            conn_timeout; /* conn timeout copied from svc*/
     unsigned            limit_proportion; /* limit copied from svc*/
 } __rte_cache_aligned;
-#endif
 
 static inline bool
 dp_vs_dest_is_avail(struct dp_vs_dest *dest)
@@ -126,6 +125,5 @@ int dp_vs_dest_get_entries(const struct dp_vs_service *svc,
 int dp_vs_dest_init(void);
 
 int dp_vs_dest_term(void);
-#endif
 
 #endif /* __DPVS_DEST_H__ */

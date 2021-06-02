@@ -119,14 +119,6 @@ void inet_ifaddr_dad_failure(struct inet_ifaddr *ifa);
 
 int idev_add_mcast_init(void *args);
 
-bool inet_chk_mcast_addr(int af, struct netif_port *dev,
-                        const union inet_addr *group,
-                        const union inet_addr *src);
-
-void inet_ifaddr_dad_failure(struct inet_ifaddr *ifa);
-
-int idev_add_mcast_init(struct netif_port *dev);
-
 int inet_addr_init(void);
 int inet_addr_term(void);
 

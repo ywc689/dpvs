@@ -88,7 +88,7 @@ struct dp_vs_service {
 
     /* ... flags, timer ... */
 } __rte_cache_aligned;
-#endif
+
 
 int dp_vs_service_init(void);
 int dp_vs_service_term(void);

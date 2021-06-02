@@ -1731,7 +1731,6 @@ static int __dp_vs_out_xmit_snat6(struct dp_vs_proto *proto,
 
     return INET_HOOK(AF_INET6, INET_HOOK_LOCAL_OUT, mbuf,
                      NULL, rt6->rt6_dev, ip6_output);
->>>>>>> wencyu/dpdk2011-rebase
 
 errout:
     if (rt6)

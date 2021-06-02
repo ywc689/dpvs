@@ -878,7 +878,6 @@ struct dp_vs_conn *dp_vs_conn_new(struct rte_mbuf *mbuf,
         new->daddr  = iph->saddr;
     else
         new->daddr  = dest->addr;
-    }
     new->dport  = rport;
     new->outwall = param->outwall;
 

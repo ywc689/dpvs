@@ -26,11 +26,7 @@
 #include "route.h"
 #include "route6.h"
 #include "inetaddr.h"
-#include "neigh.h"
-#include "netif_addr.h"
 #include "conf/inetaddr.h"
-#include "route6.h"
-#include "ndisc.h"
 
 #define IFA
 #define RTE_LOGTYPE_IFA         RTE_LOGTYPE_USER1

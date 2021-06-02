@@ -30,8 +30,6 @@
 #include <endian.h>
 #endif
 
-#include "ipvs/proto.h"
-
 /* avoid IANA ip options */
 #define IPOPT_UOA        (31 | IPOPT_CONTROL)
 #define IPOLEN_UOA_IPV4  (sizeof(struct ipopt_uoa) + 4)
@@ -144,9 +142,6 @@ struct uoa_param_map {
  */
 
 #define IPPROTO_OPT    0xf8 /* 248 */
-
-#define OPPHDR_IPV6 0x02
-#define OPPHDR_IPV4 0x01
 
 #define OPPHDR_IPV6 0x02
 #define OPPHDR_IPV4 0x01
