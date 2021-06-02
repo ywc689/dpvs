@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -28,7 +28,7 @@
 
 #include "conf/neigh.h"
 #include "neigh.h"
-#include "common.h"
+#include "conf/common.h"
 #include "ipv6.h"
 #include "ndisc.h"
 #include "icmp6.h"
@@ -48,7 +48,7 @@ struct nd_msg {
 #define __ND_OPT_ARRAY_MAX 256
 
 struct ndisc_options {
-    struct nd_opt_hdr *nd_opt_array[__ND_OPT_ARRAY_MAX]; 
+    struct nd_opt_hdr *nd_opt_array[__ND_OPT_ARRAY_MAX];
     struct nd_opt_hdr *nd_useropts;
     struct nd_opt_hdr *nd_useropts_end;
 };
@@ -60,8 +60,49 @@ struct ndisc_options {
 #define nd_opts_rh              nd_opt_array[ND_OPT_REDIRECTED_HEADER]
 #define nd_opts_mtu             nd_opt_array[ND_OPT_MTU]
 
+#ifdef CONFIG_NDISC_DEBUG
+static inline void ndisc_show_addr(const char *func,
+                                   const struct in6_addr *saddr,
+                                   const struct in6_addr *daddr)
+{
+    char sbuf[64], dbuf[64];
+
+    RTE_LOG(DEBUG, NEIGHBOUR, "%s: [%d] %s -> %s\n",
+            func, rte_lcore_id(),
+            saddr ? inet_ntop(AF_INET6, saddr, sbuf, sizeof(sbuf)) : "::",
+            daddr ? inet_ntop(AF_INET6, daddr, dbuf, sizeof(dbuf)) : "::");
+}
+
+static inline void ndisc_show_target(const char *func,
+                                     const struct in6_addr *addr,
+                                     const uint8_t *lladdr,
+                                     const struct netif_port *dev)
+{
+    char buf[64];
+
+    if (!addr) {
+        return;
+    }
+
+    inet_ntop(AF_INET6, addr, buf, sizeof(buf));
+
+    if (lladdr) {
+        RTE_LOG(DEBUG, NEIGHBOUR,
+                "%s: [%d] address: %s, "
+                "lladdr %02x:%02x:%02x:%02x:%02x:%02x, dev %s\n",
+                __func__, rte_lcore_id(), buf,
+                lladdr[0], lladdr[1], lladdr[2],
+                lladdr[3], lladdr[4], lladdr[5], dev->name);
+    } else {
+        RTE_LOG(DEBUG, NEIGHBOUR,
+                "%s: [%d] address: %s, dev %s\n",
+                __func__, rte_lcore_id(), buf, dev->name);
+    }
+}
+#endif
+
 /* ipv6 neighbour */
-static inline uint8_t *ndisc_opt_addr_data(struct nd_opt_hdr *p, 
+static inline uint8_t *ndisc_opt_addr_data(struct nd_opt_hdr *p,
                                            struct netif_port *dev)
 {
     uint8_t *lladdr = (uint8_t *)(p + 1);
@@ -147,16 +188,16 @@ static struct ndisc_options *ndisc_parse_options(uint8_t *opt, int opt_len,
     return ndopts;
 }
 
-static struct rte_mbuf *ndisc_build_mbuf(struct netif_port *dev, 
+static struct rte_mbuf *ndisc_build_mbuf(struct netif_port *dev,
                                          const struct in6_addr *daddr,
-                                         const struct in6_addr *saddr, 
+                                         const struct in6_addr *saddr,
                                          const struct icmp6_hdr *icmp6h,
-                                         const struct in6_addr *target, 
+                                         const struct in6_addr *target,
                                          int llinfo)
 {
     struct rte_mbuf *mbuf;
     struct icmp6_hdr *icmp6hdr;
-    struct ipv6_hdr iph;
+    struct rte_ipv6_hdr iph;
     int len;
     uint8_t *opt;
 
@@ -170,6 +211,7 @@ static struct rte_mbuf *ndisc_build_mbuf(struct netif_port *dev,
         RTE_LOG(ERR, NEIGHBOUR, "mbuf_pool alloc failed\n");
         return NULL;
     }
+    mbuf_userdata_reset(mbuf);
 
     icmp6hdr = (struct icmp6_hdr *)rte_pktmbuf_append(mbuf, sizeof(*icmp6h));
     rte_memcpy(icmp6hdr, icmp6h, sizeof(*icmp6h));
@@ -196,9 +238,9 @@ static struct rte_mbuf *ndisc_build_mbuf(struct netif_port *dev,
     return mbuf;
 }
 
-static void ndisc_send_na(struct netif_port *dev, 
-                          const struct in6_addr *daddr, 
-                          const struct in6_addr *solicited_addr, 
+static void ndisc_send_na(struct netif_port *dev,
+                          const struct in6_addr *daddr,
+                          const struct in6_addr *solicited_addr,
                           int solicited, int override, int inc_opt)
 {
     struct inet_ifaddr *ifa;
@@ -225,7 +267,7 @@ static void ndisc_send_na(struct netif_port *dev,
         icmp6h.icmp6_pptr |= ND_NA_FLAG_OVERRIDE;
 
     /*ndisc*/
-    mbuf = ndisc_build_mbuf(dev, daddr, src_addr, &icmp6h, solicited_addr, 
+    mbuf = ndisc_build_mbuf(dev, daddr, src_addr, &icmp6h, solicited_addr,
                                      inc_opt ? ND_OPT_TARGET_LINKADDR : 0);
     if (!mbuf)
         return;
@@ -237,13 +279,17 @@ static void ndisc_send_na(struct netif_port *dev,
     fl6.fl6_proto = IPPROTO_ICMPV6;
     fl6.fl6_ttl   = 255;
 
+#ifdef CONFIG_NDISC_DEBUG
+    ndisc_show_addr(__func__, src_addr, daddr);
+#endif
+
     ipv6_xmit(mbuf, &fl6);
 }
 
 /* saddr can be 0 in ns for dad in addrconf_dad_timer */
-static void ndisc_send_ns(struct netif_port *dev, 
+static void ndisc_send_ns(struct netif_port *dev,
                           const struct in6_addr *solicit,
-                          const struct in6_addr *daddr, 
+                          const struct in6_addr *daddr,
                           const struct in6_addr *saddr)
 {
     struct rte_mbuf *mbuf;
@@ -262,7 +308,7 @@ static void ndisc_send_ns(struct netif_port *dev,
     memset(&icmp6h, 0, sizeof(icmp6h));
     icmp6h.icmp6_type = ND_NEIGHBOR_SOLICIT;
 
-    mbuf = ndisc_build_mbuf(dev, daddr, saddr, &icmp6h, solicit, 
+    mbuf = ndisc_build_mbuf(dev, daddr, saddr, &icmp6h, solicit,
               !ipv6_addr_any(saddr) ? ND_OPT_SOURCE_LINKADDR : 0);
     if (!mbuf)
         return;
@@ -274,10 +320,14 @@ static void ndisc_send_ns(struct netif_port *dev,
     fl6.fl6_proto = IPPROTO_ICMPV6;
     fl6.fl6_ttl   = 255;
 
+#ifdef CONFIG_NDISC_DEBUG
+    ndisc_show_addr(__func__, saddr, daddr);
+#endif
+
     ipv6_xmit(mbuf, &fl6);
 }
 
-void ndisc_send_dad(struct netif_port *dev, 
+void ndisc_send_dad(struct netif_port *dev,
                     const struct in6_addr* solicit)
 {
     struct in6_addr mcaddr;
@@ -285,20 +335,15 @@ void ndisc_send_dad(struct netif_port *dev,
     ndisc_send_ns(dev, solicit, &mcaddr, &in6addr_any);
 }
 
-void ndisc_solicit(struct neighbour_entry *neigh, 
+void ndisc_solicit(struct neighbour_entry *neigh,
                    const struct in6_addr *saddr)
 {
     struct in6_addr mcaddr;
     struct netif_port *dev = neigh->port;
     struct in6_addr *target = &neigh->ip_addr.in6;
 
-    if (neigh->state == DPVS_NUD_S_PROBE || 
-        neigh->state == DPVS_NUD_S_DELAY) {
-        ndisc_send_ns(dev, target, target, saddr);
-    } else {
-        addrconf_addr_solict_mult(target, &mcaddr);
-        ndisc_send_ns(dev, target, &mcaddr, saddr);
-    }
+    addrconf_addr_solict_mult(target, &mcaddr);
+    ndisc_send_ns(dev, target, &mcaddr, saddr);
 }
 
 static int ndisc_recv_ns(struct rte_mbuf *mbuf, struct netif_port *dev)
@@ -311,11 +356,15 @@ static int ndisc_recv_ns(struct rte_mbuf *mbuf, struct netif_port *dev)
     int hashkey = 0;
     uint32_t ndoptlen = 0;
 
-    struct in6_addr *saddr = &((struct ip6_hdr *)mbuf->userdata)->ip6_src;
-    struct in6_addr *daddr = &((struct ip6_hdr *)mbuf->userdata)->ip6_dst;
+    struct in6_addr *saddr = &MBUF_USERDATA(mbuf, struct ip6_hdr *, MBUF_FIELD_PROTO)->ip6_src;
+    struct in6_addr *daddr = &MBUF_USERDATA(mbuf, struct ip6_hdr *, MBUF_FIELD_PROTO)->ip6_dst;
 
     struct nd_msg *msg = rte_pktmbuf_mtod(mbuf, struct nd_msg *);
     int dad = ipv6_addr_any(saddr);
+
+#ifdef CONFIG_NDISC_DEBUG
+    ndisc_show_addr(__func__, saddr, daddr);
+#endif
 
     if (mbuf_may_pull(mbuf, sizeof(struct nd_msg)))
         return EDPVS_DROP;
@@ -337,10 +386,17 @@ static int ndisc_recv_ns(struct rte_mbuf *mbuf, struct netif_port *dev)
         return EDPVS_DROP;
     }
 
+    ifa = inet_addr_ifa_get(AF_INET6, dev, (union inet_addr *)&msg->target);
+    if (!ifa) {
+        RTE_LOG(ERR, NEIGHBOUR, "[%s] RECVNs: dpvs is not the target!\n", __func__);
+        return EDPVS_KNICONTINUE;
+    }
+
     if (ndopts.nd_opts_src_lladdr) {
         lladdr = ndisc_opt_addr_data(ndopts.nd_opts_src_lladdr, dev);
         if (!lladdr) {
             RTE_LOG(ERR, NEIGHBOUR, "[%s] NS: invalid link-layer address\n", __func__);
+            inet_addr_ifa_put(ifa);
             return EDPVS_DROP;
         }
         /*
@@ -351,19 +407,18 @@ static int ndisc_recv_ns(struct rte_mbuf *mbuf, struct netif_port *dev)
         if (dad) {
             RTE_LOG(ERR, NEIGHBOUR, "[%s] NS: bad DAD packet (link-layer address option)\n", \
                                                                              __func__);
+            inet_addr_ifa_put(ifa);
             return EDPVS_DROP;
         }
+    } else {
+        /* ingnore mbuf without opt */
+        inet_addr_ifa_put(ifa);
+        return EDPVS_KNICONTINUE;
     }
 
     inc = ipv6_addr_is_multicast(daddr);
 
-    ifa = inet_addr_ifa_get(AF_INET6, dev, (union inet_addr *)&msg->target);
-    if (!ifa) {
-        RTE_LOG(ERR, NEIGHBOUR, "[%s] RECVNs: dpvs is not the target!\n", __func__);
-        return EDPVS_KNICONTINUE;
-    }
-
-    /* 
+    /*
      * dad response src_addr should be link local, daddr should be multi ff02::1
      * optimistic addr not support
      */
@@ -382,22 +437,24 @@ static int ndisc_recv_ns(struct rte_mbuf *mbuf, struct netif_port *dev)
     inet_addr_ifa_put(ifa);
 
     /* update/create neighbour */
-    hashkey = neigh_hashkey((union inet_addr *)saddr, dev);
+    hashkey = neigh_hashkey(AF_INET6, (union inet_addr *)saddr, dev);
     neigh = neigh_lookup_entry(AF_INET6, (union inet_addr *)saddr, dev, hashkey);
     if (neigh && !(neigh->flag & NEIGHBOUR_STATIC)) {
-        neigh_edit(neigh, (struct ether_addr *)lladdr, hashkey);
+        neigh_edit(neigh, (struct rte_ether_addr *)lladdr);
         neigh_entry_state_trans(neigh, 1);
+        neigh_sync_core(neigh, 1, NEIGH_ENTRY);
     } else {
-        neigh = neigh_add_table(AF_INET6, (union inet_addr *)saddr, 
-                      (struct ether_addr *)lladdr, dev, hashkey, 0);
+        neigh = neigh_add_table(AF_INET6, (union inet_addr *)saddr,
+                      (struct rte_ether_addr *)lladdr, dev, hashkey, 0);
         if (!neigh){
             RTE_LOG(ERR, NEIGHBOUR, "[%s] add neighbour wrong\n", __func__);
             return EDPVS_NOMEM;
         }
         neigh_entry_state_trans(neigh, 1);
+        neigh_sync_core(neigh, 1, NEIGH_ENTRY);
     }
     neigh_send_mbuf_cach(neigh);
-    
+
     ndisc_send_na(dev, saddr, &msg->target,
                   1, inc, inc);
 
@@ -411,12 +468,14 @@ static int ndisc_recv_na(struct rte_mbuf *mbuf, struct netif_port *dev)
     struct neighbour_entry *neigh;
     struct inet_ifaddr *ifa;
     int hashkey;
-
-    struct in6_addr *saddr = &((struct ip6_hdr *)mbuf->userdata)->ip6_src;
-    struct in6_addr *daddr = &((struct ip6_hdr *)mbuf->userdata)->ip6_dst;
-
+    struct in6_addr *daddr = &MBUF_USERDATA(mbuf, struct ip6_hdr *, MBUF_FIELD_PROTO)->ip6_dst;
     struct nd_msg *msg = rte_pktmbuf_mtod(mbuf, struct nd_msg *);
     uint32_t ndoptlen = mbuf->data_len - offsetof(struct nd_msg, opt);
+
+#ifdef CONFIG_NDISC_DEBUG
+    struct in6_addr *saddr = &MBUF_USERDATA(mbuf, struct ip6_hdr *, MBUF_FIELD_PROTO)->ip6_src;
+    ndisc_show_addr(__func__, saddr, daddr);
+#endif
 
     if (mbuf_may_pull(mbuf, sizeof(struct nd_msg))) {
         RTE_LOG(ERR, NEIGHBOUR, "ICMPv6 NA: packet too short.\n");
@@ -438,6 +497,16 @@ static int ndisc_recv_na(struct rte_mbuf *mbuf, struct netif_port *dev)
         return EDPVS_DROP;
     }
 
+    ifa = inet_addr_ifa_get(AF_INET6, dev, (union inet_addr *)&msg->target);
+    if (ifa) {
+        RTE_LOG(ERR, NEIGHBOUR, "ICMPv6 NA: someone advertises our address.\n");
+        if (ifa->flags & (IFA_F_TENTATIVE | IFA_F_OPTIMISTIC)) {
+            inet_ifaddr_dad_failure(ifa);
+        }
+        inet_addr_ifa_put(ifa);
+        return EDPVS_KNICONTINUE;
+    }
+
     if (ndopts.nd_opts_tgt_lladdr) {
         lladdr = ndisc_opt_addr_data(ndopts.nd_opts_tgt_lladdr, dev);
         if (!lladdr) {
@@ -449,30 +518,26 @@ static int ndisc_recv_na(struct rte_mbuf *mbuf, struct netif_port *dev)
         return EDPVS_KNICONTINUE;
     }
 
-    ifa = inet_addr_ifa_get(AF_INET6, dev, (union inet_addr *)&msg->target);
-    if (ifa) {
-        RTE_LOG(ERR, NEIGHBOUR, "ICMPv6 NA: someone advertises our address.\n");
-        if (ifa->flags & (IFA_F_TENTATIVE | IFA_F_OPTIMISTIC)) {
-            inet_ifaddr_dad_failure(ifa);
-        }
-        inet_addr_ifa_put(ifa);
-        return EDPVS_KNICONTINUE;
-    }
+#ifdef CONFIG_NDISC_DEBUG
+    ndisc_show_target(__func__, &msg->target, lladdr, dev);
+#endif
 
     /* notice: override flag ignored */
-    hashkey = neigh_hashkey((union inet_addr *)saddr, dev);
+    hashkey = neigh_hashkey(AF_INET6, (union inet_addr *)&msg->target, dev);
     neigh = neigh_lookup_entry(AF_INET6, (union inet_addr *)&msg->target, dev, hashkey);
     if (neigh && !(neigh->flag & NEIGHBOUR_STATIC)) {
-        neigh_edit(neigh, (struct ether_addr *)lladdr, hashkey);
+        neigh_edit(neigh, (struct rte_ether_addr *)lladdr);
         neigh_entry_state_trans(neigh, 1);
+        neigh_sync_core(neigh, 1, NEIGH_ENTRY);
     } else {
-        neigh = neigh_add_table(AF_INET6, (union inet_addr *)saddr,
-                       (struct ether_addr *)lladdr, dev, hashkey, 0);
-        if(!neigh){
+        neigh = neigh_add_table(AF_INET6, (union inet_addr *)&msg->target,
+                       (struct rte_ether_addr *)lladdr, dev, hashkey, 0);
+        if (!neigh) {
            RTE_LOG(ERR, NEIGHBOUR, "[%s] add neighbour wrong\n", __func__);
            return EDPVS_NOMEM;
         }
         neigh_entry_state_trans(neigh, 1);
+        neigh_sync_core(neigh, 1, NEIGH_ENTRY);
     }
     neigh_send_mbuf_cach(neigh);
 
@@ -483,7 +548,7 @@ int ndisc_rcv(struct rte_mbuf *mbuf, struct netif_port *dev)
 {
     struct nd_msg *msg;
     int ret;
-    struct ip6_hdr *ipv6_hdr = mbuf->userdata;
+    struct ip6_hdr *ipv6_hdr = MBUF_USERDATA(mbuf, struct ip6_hdr *, MBUF_FIELD_PROTO);
 
     if (mbuf_may_pull(mbuf, sizeof(struct icmp6_hdr)) != 0) {
         ret = EDPVS_NOMEM;
@@ -535,4 +600,3 @@ free:
     rte_pktmbuf_free(mbuf);
     return ret;
 }
-

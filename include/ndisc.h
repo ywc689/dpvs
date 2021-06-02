@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -20,13 +20,13 @@
 
 #include "neigh.h"
 
-int ndisc_rcv(struct rte_mbuf *mbuf, 
+int ndisc_rcv(struct rte_mbuf *mbuf,
               struct netif_port *dev);
 
-void ndisc_send_dad(struct netif_port *dev, 
+void ndisc_send_dad(struct netif_port *dev,
                     const struct in6_addr* solicit);
 
-void ndisc_solicit(struct neighbour_entry *neigh, 
+void ndisc_solicit(struct neighbour_entry *neigh,
                    const struct in6_addr *saddr);
 
 #endif /* __DPVS_NDISC_H__ */

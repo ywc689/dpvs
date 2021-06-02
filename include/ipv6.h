@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -42,6 +42,11 @@ static inline struct ip6_hdr *ip6_hdr(const struct rte_mbuf *mbuf)
     return rte_pktmbuf_mtod(mbuf, struct ip6_hdr *);
 }
 
+static inline bool ip6_is_frag(struct ip6_hdr *ip6h)
+{
+    return (ip6h->ip6_nxt == IPPROTO_FRAGMENT);
+}
+
 enum {
     INET6_PROTO_F_NONE      = 0x01,
     INET6_PROTO_F_FINAL     = 0x02,
@@ -72,6 +77,9 @@ int ipv6_init(void);
 int ipv6_term(void);
 
 int ipv6_xmit(struct rte_mbuf *mbuf, struct flow6 *fl6);
+int ip6_output(struct rte_mbuf *mbuf);
+
+int ip6_local_out(struct rte_mbuf *mbuf);
 
 int ipv6_register_hooks(struct inet_hook_ops *ops, size_t n);
 int ipv6_unregister_hooks(struct inet_hook_ops *ops, size_t n);
@@ -94,8 +102,25 @@ int ipv6_ctrl_term(void);
 int ipv6_exthdrs_init(void);
 void ipv6_exthdrs_term(void);
 int ipv6_parse_hopopts(struct rte_mbuf *mbuf);
-int ip6_skip_exthdr(const struct rte_mbuf *mbuf, int start, uint8_t *nexthdrp);
+int ip6_skip_exthdr(const struct rte_mbuf *imbuf, int start,
+                    __u8 *nexthdrp);
 /* get ipv6 header length, including extension header length. */
 int ip6_hdrlen(const struct rte_mbuf *mbuf);
+
+/*
+ * Exthdr supported checksum function for upper layer protocol.
+ * @param ol_flags
+ *    The ol_flags of the associated mbuf.
+ * @param exthdrlen
+ *    The IPv6 fixed header length plus the extension header length.
+ * @param l4_proto
+ *    The L4 protocol type, i.e. IPPROTO_TCP, IPPROTO_UDP, IPPROTO_ICMP
+ * @return
+ *    The non-complemented checksum to set in the L4 header.
+ */
+uint16_t ip6_phdr_cksum(struct ip6_hdr*, uint64_t ol_flags,
+        uint32_t exthdrlen, uint8_t l4_proto);
+uint16_t ip6_udptcp_cksum(struct ip6_hdr*, const void *l4_hdr,
+        uint32_t exthdrlen, uint8_t l4_proto);
 
 #endif /* __DPVS_IPV6_H__ */

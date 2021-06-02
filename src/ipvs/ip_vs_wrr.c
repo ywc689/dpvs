@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -25,38 +25,6 @@ struct dp_vs_wrr_mark {
     int mw;         /* maximum weight */
     int di;         /* decreasing interval */
 };
-
-/*
- *    Get the gcd of server weights
- */
-static int gcd(int a, int b)
-{
-    int c;
-
-    while ((c = a % b)) {
-        a = b;
-        b = c;
-    }
-    return b;
-}
-
-static int dp_vs_wrr_gcd_weight(struct dp_vs_service *svc)
-{
-    struct dp_vs_dest *dest;
-    int weight;
-    int g = 0;
-
-    list_for_each_entry(dest, &svc->dests, n_list) {
-        weight = rte_atomic16_read(&dest->weight);
-        if (weight > 0) {
-            if (g > 0)
-                g = gcd(weight, g);
-            else
-                g = weight;
-        }
-    }
-    return g ? g : 1;
-}
 
 /*
  *    Get the maximum weight of the service destinations.
@@ -89,7 +57,7 @@ static int dp_vs_wrr_init_svc(struct dp_vs_service *svc)
     mark->cl = &svc->dests;
     mark->cw = 0;
     mark->mw = dp_vs_wrr_max_weight(svc);
-    mark->di = dp_vs_wrr_gcd_weight(svc);
+    mark->di = dp_vs_gcd_weight(svc);
     svc->sched_data = mark;
 
     return EDPVS_OK;
@@ -105,13 +73,14 @@ static int dp_vs_wrr_done_svc(struct dp_vs_service *svc)
     return EDPVS_OK;
 }
 
-static int dp_vs_wrr_update_svc(struct dp_vs_service *svc)
+static int dp_vs_wrr_update_svc(struct dp_vs_service *svc,
+        struct dp_vs_dest *dest __rte_unused, sockoptid_t opt __rte_unused)
 {
     struct dp_vs_wrr_mark *mark = svc->sched_data;
 
     mark->cl = &svc->dests;
     mark->mw = dp_vs_wrr_max_weight(svc);
-    mark->di = dp_vs_wrr_gcd_weight(svc);
+    mark->di = dp_vs_gcd_weight(svc);
     if (mark->cw > mark->mw)
         mark->cw = 0;
     return 0;
@@ -121,7 +90,7 @@ static int dp_vs_wrr_update_svc(struct dp_vs_service *svc)
  * Weighted Round-Robin Scheduling
  */
 static struct dp_vs_dest *dp_vs_wrr_schedule(struct dp_vs_service *svc,
-                                             const struct rte_mbuf *mbuf)
+                    const struct rte_mbuf *mbuf, const struct dp_vs_iphdr *iph __rte_unused)
 {
     struct dp_vs_dest *dest;
     struct dp_vs_wrr_mark *mark = svc->sched_data;
@@ -131,7 +100,6 @@ static struct dp_vs_dest *dp_vs_wrr_schedule(struct dp_vs_service *svc,
      * This loop will always terminate, because mark->cw in (0, max_weight]
      * and at least one server has its weight equal to max_weight.
      */
-    rte_rwlock_write_lock(&svc->sched_lock);
     p = mark->cl;
     while (1) {
         if (mark->cl == &svc->dests) {
@@ -162,8 +130,7 @@ static struct dp_vs_dest *dp_vs_wrr_schedule(struct dp_vs_service *svc,
         if (mark->cl != &svc->dests) {
             /* not at the head of the list */
             dest = list_entry(mark->cl, struct dp_vs_dest, n_list);
-            if (!(dest->flags & DPVS_DEST_F_OVERLOAD) &&
-                (dest->flags & DPVS_DEST_F_AVAILABLE) &&
+            if (dp_vs_dest_is_valid(dest) &&
                 rte_atomic16_read(&dest->weight) >= mark->cw) {
                 /* got it */
                 break;
@@ -179,7 +146,6 @@ static struct dp_vs_dest *dp_vs_wrr_schedule(struct dp_vs_service *svc,
     }
 
       out:
-    rte_rwlock_write_unlock(&svc->sched_lock);
 
     return dest;
 }
@@ -202,5 +168,3 @@ int  dp_vs_wrr_term(void)
 {
     return unregister_dp_vs_scheduler(&dp_vs_wrr_scheduler);
 }
-
-

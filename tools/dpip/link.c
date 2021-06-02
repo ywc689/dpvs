@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -20,7 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
-#include "common.h"
+#include "conf/common.h"
 #include "dpip.h"
 #include "conf/netif.h"
 #include "sockopt.h"
@@ -80,7 +80,7 @@ struct link_param
     char dev_name[LINK_DEV_NAME_MAXLEN];
     char item[LINK_ARG_ITEM_MAXLEN]; /* for SET cmd */
     char value[LINK_ARG_VALUE_MAXLEN]; /* for SET cmd */
-}; 
+};
 
 bool g_color = false;
 netif_nic_list_get_t *g_nic_list = NULL;
@@ -113,7 +113,7 @@ static inline int get_netif_port_list(void)
 
 static void link_help(void)
 {
-    fprintf(stderr, 
+    fprintf(stderr,
             "Usage:\n"
             "    dpip link show [ NIC-NAME ]\n"
             "    dpip link show BOND-NAME status\n"
@@ -225,7 +225,7 @@ static int dump_nic_basic(char *name, int namelen)
             (void **)&p_get, &len);
     if (err != EDPVS_OK || !p_get || !len)
         return err;
-    get = *p_get; 
+    get = *p_get;
     dpvs_sockopt_msg_free(p_get);
 
     printf("%d: %s: socket %d mtu %d rx-queue %d tx-queue %d\n",
@@ -281,7 +281,7 @@ static int dump_nic_stats(char *name, int namelen)
             (void **)&p_get, &len);
     if (err != EDPVS_OK || !p_get || !len)
         return err;
-    get = *p_get; 
+    get = *p_get;
     dpvs_sockopt_msg_free(p_get);
 
     assert(len == sizeof(netif_nic_stats_get_t));
@@ -328,12 +328,12 @@ static int dump_nic_verbose(char *name, int namelen)
             ext_get->dev_info.max_vfs);
     printf("    %-16s%-16s%-16s%-16s\n", "max_vmdq_pools", "rx_ol_capa",
             "tx_ol_capa", "reta_size");
-    printf("    %-16u%-16u%-16u%-16u\n", ext_get->dev_info.max_vmdq_pools,
+    printf("    %-16u0x%-14X0x%-14X%-16u\n", ext_get->dev_info.max_vmdq_pools,
             ext_get->dev_info.rx_offload_capa, ext_get->dev_info.tx_offload_capa,
             ext_get->dev_info.reta_size);
     printf("    %-16s%-16s%-16s%-16s\n", "hash_key_size", "flowtype_rss_ol",
             "vmdq_que_base", "vmdq_que_num");
-    printf("    %-16u%-16lu%-16u%-16u\n", ext_get->dev_info.hash_key_size,
+    printf("    %-16u0x%-14lX%-16u%-16u\n", ext_get->dev_info.hash_key_size,
             ext_get->dev_info.flow_type_rss_offloads,
             ext_get->dev_info.vmdq_queue_base, ext_get->dev_info.vmdq_queue_num);
     printf("    %-16s%-16s%-16s%-16s\n", "rx_desc_max", "rx_desc_min",
@@ -405,27 +405,27 @@ static int dump_nic_stats_velocity(char *name, int namelen, int interval, int co
                 (void **)&p_get, &len);
         if (err != EDPVS_OK || !p_get || !len)
             return err;
-        get1 = *p_get; 
+        get1 = *p_get;
         dpvs_sockopt_msg_free(p_get);
-    
+
         sleep(interval);
-    
+
         err = dpvs_getsockopt(SOCKOPT_NETIF_GET_PORT_STATS, name, namelen,
                 (void **)&p_get, &len);
         if (err != EDPVS_OK || !p_get || !len)
             return err;
-        get2 = *p_get; 
+        get2 = *p_get;
         dpvs_sockopt_msg_free(p_get);
-    
+
         calc_nic_stats_velocity(interval, &get1, &get2, &velocity);
-    
+
         if (g_color) {
             if (tk % 2)
                 printf(BLUE);
             else
                 printf(GREEN);
         }
-    
+
         printf("    %-16s%-16s%-16s%-16s\n",
                 "ipackets/pps", "opackets/pps", "ibytes/Bps", "obytes/Bps");
         printf("    %-16lu%-16lu%-16lu%-16lu\n",
@@ -434,7 +434,7 @@ static int dump_nic_stats_velocity(char *name, int namelen, int interval, int co
                 "ierrors/pps", "oerrors/pps", "imissed/pps", "rx_nombuf/pps");
         printf("    %-16lu%-16lu%-16lu%-16lu\n",
                 velocity.ierrors, velocity.oerrors, velocity.imissed, velocity.rx_nombuf);
-    
+
         ++tk;
         if (count > 0 && tk > count)
             break;
@@ -585,7 +585,7 @@ static int dump_cpu_stats_velocity(lcoreid_t cid, int interval, int count)
         assert(len == sizeof(netif_lcore_stats_get_t));
         get1 = *p_get;
         dpvs_sockopt_msg_free(p_get);
-        
+
         sleep(interval);
 
         err = dpvs_getsockopt(SOCKOPT_NETIF_GET_LCORE_STATS, &cid, sizeof(cid),
@@ -597,7 +597,7 @@ static int dump_cpu_stats_velocity(lcoreid_t cid, int interval, int count)
         dpvs_sockopt_msg_free(p_get);
 
         calc_cpu_stats_velocity(interval, &get1, &get2, &velocity);
-        
+
         if (g_color) {
             if (tk % 2)
                 printf(BLUE);
@@ -614,7 +614,7 @@ static int dump_cpu_stats_velocity(lcoreid_t cid, int interval, int count)
                 "z2hpktburst/nps", "h2fpktburst/nps", "dropped/nps");
         printf("    %-16lu%-16lu%-16lu\n",
                 velocity.z2hpktburst, velocity.h2fpktburst, velocity.dropped);
-        
+
         printf("    %-16s%-16s%-16s%-16s\n",
                 "ipackets/pps", "ibytes/Bps", "opackets/pps", "obytes/Bps");
         printf("    %-16lu%-16lu%-16lu%-16lu\n",
@@ -694,7 +694,7 @@ static int link_show(struct link_param *param)
             if (param->dev_name[0]) { /* show information of specified NIC */
                 return link_nic_show(param);
             } else { /* show infomation of all NIC */
-                if (get_netif_port_list() < 0)
+                if (get_netif_port_list() != EDPVS_OK)
                     return EDPVS_INVAL;
                 ret = EDPVS_OK;
                 for (ii = 0; ii < g_nic_list->nic_num && ii < NETIF_MAX_PORTS; ii++) {
@@ -744,6 +744,14 @@ static int link_show(struct link_param *param)
                     fprintf(stderr, "Fail to get information for Master cpu%d\n",
                             lcores.master_lcore_id);
                     ret = err;
+                }
+                if (lcores.kni_lcore_id) {
+                    err = link_cpu_show(lcores.kni_lcore_id, param);
+                    if (err) {
+                        fprintf(stderr, "Fail to get information for KNI cpu%d\n",
+                                lcores.kni_lcore_id);
+                        ret = err;
+                    }
                 }
 
                 printf("<< Data Plane >>\n");
@@ -1180,7 +1188,7 @@ struct dpip_obj dpip_link = {
 static void __init addr_init(void)
 {
     dpip_register_obj(&dpip_link);
-} 
+}
 
 static void __exit addr_exit(void)
 {

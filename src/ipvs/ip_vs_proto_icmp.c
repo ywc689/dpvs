@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -24,15 +24,17 @@
 #include <linux/icmp.h>
 #include <netinet/icmp6.h>
 #include "dpdk.h"
-#include "common.h"
+#include "conf/common.h"
 #include "inet.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "icmp6.h"
 #include "ipvs/ipvs.h"
 #include "ipvs/proto.h"
 #include "ipvs/proto_icmp.h"
 #include "ipvs/conn.h"
 #include "ipvs/service.h"
+#include "ipvs/redirect.h"
 
 /*
  * o ICMP tuple
@@ -59,6 +61,8 @@
  *      - ip_vs_nat_xmit() or ip_vs_out_snat_xmit()
  *      - handle_response()
  *
+ *   + For ICMPv6 messages in SNAT/DNAT/FULLNAT, checksum should be recaculate.
+ *
  *   + For ICMP-Error, which includes original IP packet as payload:
  *     Those embedded IPs are not be handled here IPVS core.
  */
@@ -77,6 +81,7 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
     void *ich = NULL;
     struct dp_vs_service *svc;
     int af = iph->af;
+    bool outwall = false;
     assert(proto && iph && mbuf && conn && verdict);
 
     if (AF_INET6 == af) {
@@ -94,22 +99,20 @@ static int icmp_conn_sched(struct dp_vs_proto *proto,
         return EDPVS_INVPKT;
     }
 
-    svc = dp_vs_service_lookup(iph->af, iph->proto,
-                               &iph->daddr, 0, 0, mbuf, NULL);
+    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, 0, 0, 
+                               mbuf, NULL, &outwall, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
         return EDPVS_NOSERV;
     }
 
     /* schedule RS and create new connection */
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(svc, iph, mbuf, false, outwall);
     if (!*conn) {
-        dp_vs_service_put(svc);
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
     }
 
-    dp_vs_service_put(svc);
     return EDPVS_OK;
 }
 
@@ -178,8 +181,9 @@ static bool is_icmp6_reply(uint8_t type) {
 
 static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
                                            const struct dp_vs_iphdr *iph,
-                                           struct rte_mbuf *mbuf, int *direct, 
-                                           bool reverse, bool *drop)
+                                           struct rte_mbuf *mbuf, int *direct,
+                                           bool reverse, bool *drop,
+                                           lcoreid_t *peer_cid)
 {
     void *ich = NULL;
     __be16 sport, dport; /* dummy ports */
@@ -188,6 +192,7 @@ static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
     /* true icmp type/code, used for v4/v6 */
     uint8_t icmp_type = 0;
     uint8_t icmp_code = 0;
+    struct dp_vs_conn *conn;
     assert(proto && iph && mbuf);
 
     if (AF_INET6 == af) {
@@ -214,6 +219,7 @@ static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
                                                   (void *)&_icmph);
         if (unlikely(!ich))
             return NULL;
+
         /* icmp v4 */
         icmp_type = ((struct icmphdr *)ich)->type;
         icmp_code = ((struct icmphdr *)ich)->code;
@@ -228,8 +234,42 @@ static struct dp_vs_conn *icmp_conn_lookup(struct dp_vs_proto *proto,
         }
     }
 
-    return dp_vs_conn_get(iph->af, iph->proto, &iph->saddr, &iph->daddr,
+    conn = dp_vs_conn_get(iph->af, iph->proto, &iph->saddr, &iph->daddr,
                           sport, dport, direct, reverse);
+    if (conn) {
+        return conn;
+    } else {
+        struct dp_vs_redirect *r;
+
+        r = dp_vs_redirect_get(iph->af, iph->proto,
+                               &iph->saddr, &iph->daddr,
+                               sport, dport);
+        if (r) {
+            *peer_cid = r->cid;
+        }
+    }
+
+    return conn;
+}
+
+static int icmp6_csum_handler(struct dp_vs_proto *proto,
+                              struct dp_vs_conn *conn, struct rte_mbuf *mbuf)
+{
+    struct ip6_hdr *ip6h = ip6_hdr(mbuf);
+    struct icmp6_hdr *ich;
+    uint8_t ip6nxt = ip6h->ip6_nxt;
+    int offset = ip6_skip_exthdr(mbuf, sizeof(struct ip6_hdr), &ip6nxt);
+
+    if (unlikely(mbuf_may_pull(mbuf, offset + sizeof(struct icmp6_hdr)) != 0))
+        return EDPVS_INVPKT;
+
+    ich = rte_pktmbuf_mtod_offset(mbuf, struct icmp6_hdr *, offset);
+    if (unlikely(!ich))
+        return EDPVS_INVPKT;
+
+    icmp6_send_csum(ip6h, ich);
+
+    return EDPVS_OK;
 }
 
 static int icmp_state_trans(struct dp_vs_proto *proto, struct dp_vs_conn *conn,
@@ -246,4 +286,18 @@ struct dp_vs_proto dp_vs_proto_icmp = {
     .conn_sched     = icmp_conn_sched,
     .conn_lookup    = icmp_conn_lookup,
     .state_trans    = icmp_state_trans,
+};
+
+struct dp_vs_proto dp_vs_proto_icmp6 = {
+    .name             = "ICMPV6",
+    .proto            = IPPROTO_ICMPV6,
+    .conn_sched       = icmp_conn_sched,
+    .conn_lookup      = icmp_conn_lookup,
+    .nat_in_handler   = icmp6_csum_handler,
+    .nat_out_handler  = icmp6_csum_handler,
+    .fnat_in_handler  = icmp6_csum_handler,
+    .fnat_out_handler = icmp6_csum_handler,
+    .snat_in_handler  = icmp6_csum_handler,
+    .snat_out_handler = icmp6_csum_handler,
+    .state_trans      = icmp_state_trans,
 };

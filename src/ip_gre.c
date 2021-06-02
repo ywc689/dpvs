@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2018 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -52,47 +52,47 @@ static struct ip_tunnel_tab gre_tunnel_tab;
 /* linux: gre_flags_to_tnl_flags */
 static inline __be16 flags_gre2tnl(__be16 flags)
 {
-	__be16 tflags = 0;
+    __be16 tflags = 0;
 
-	if (flags & GRE_F_CSUM)
-		tflags |= TUNNEL_F_CSUM;
-	if (flags & GRE_F_ROUTING)
-		tflags |= TUNNEL_F_ROUTING;
-	if (flags & GRE_F_KEY)
-		tflags |= TUNNEL_F_KEY;
-	if (flags & GRE_F_SEQ)
-		tflags |= TUNNEL_F_SEQ;
-	if (flags & GRE_F_STRICT)
-		tflags |= TUNNEL_F_STRICT;
-	if (flags & GRE_F_REC)
-		tflags |= TUNNEL_F_REC;
-	if (flags & GRE_F_VERSION)
-		tflags |= TUNNEL_F_VERSION;
+    if (flags & GRE_F_CSUM)
+        tflags |= TUNNEL_F_CSUM;
+    if (flags & GRE_F_ROUTING)
+        tflags |= TUNNEL_F_ROUTING;
+    if (flags & GRE_F_KEY)
+        tflags |= TUNNEL_F_KEY;
+    if (flags & GRE_F_SEQ)
+        tflags |= TUNNEL_F_SEQ;
+    if (flags & GRE_F_STRICT)
+        tflags |= TUNNEL_F_STRICT;
+    if (flags & GRE_F_REC)
+        tflags |= TUNNEL_F_REC;
+    if (flags & GRE_F_VERSION)
+        tflags |= TUNNEL_F_VERSION;
 
-	return tflags;
+    return tflags;
 }
 
 /* linux: gre_tnl_flags_to_gre_flags */
 static inline __be16 flags_tnl2gre(__be16 tflags)
 {
-	__be16 flags = 0;
+    __be16 flags = 0;
 
-	if (tflags & TUNNEL_F_CSUM)
-		flags |= GRE_F_CSUM;
-	if (tflags & TUNNEL_F_ROUTING)
-		flags |= GRE_F_ROUTING;
-	if (tflags & TUNNEL_F_KEY)
-		flags |= GRE_F_KEY;
-	if (tflags & TUNNEL_F_SEQ)
-		flags |= GRE_F_SEQ;
-	if (tflags & TUNNEL_F_STRICT)
-		flags |= GRE_F_STRICT;
-	if (tflags & TUNNEL_F_REC)
-		flags |= GRE_F_REC;
-	if (tflags & TUNNEL_F_VERSION)
-		flags |= GRE_F_VERSION;
+    if (tflags & TUNNEL_F_CSUM)
+        flags |= GRE_F_CSUM;
+    if (tflags & TUNNEL_F_ROUTING)
+        flags |= GRE_F_ROUTING;
+    if (tflags & TUNNEL_F_KEY)
+        flags |= GRE_F_KEY;
+    if (tflags & TUNNEL_F_SEQ)
+        flags |= GRE_F_SEQ;
+    if (tflags & TUNNEL_F_STRICT)
+        flags |= GRE_F_STRICT;
+    if (tflags & TUNNEL_F_REC)
+        flags |= GRE_F_REC;
+    if (tflags & TUNNEL_F_VERSION)
+        flags |= GRE_F_VERSION;
 
-	return flags;
+    return flags;
 }
 
 static inline __be16 gre_checksum(struct rte_mbuf *mbuf)
@@ -271,7 +271,7 @@ static int gre_rcv(struct rte_mbuf *mbuf)
     if (hlen < 0)
         goto drop;
 
-    iph = mbuf->userdata; /* see ipv4_local_in_fin */
+    iph = MBUF_USERDATA(mbuf, struct iphdr *, MBUF_FIELD_PROTO); /* see ipv4_local_in_fin */
     assert(iph->version == 4 && iph->protocol == IPPROTO_GRE);
 
     tnl = ip_tunnel_lookup(&gre_tunnel_tab, mbuf->port, tpi.flags,

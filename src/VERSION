@@ -1,9 +1,33 @@
 #!/bin/sh -
 # program: dpvs
-# commit: ff3e0b3159bb7562844b332b24178812f5612ea1
-# Jun 21, 2018
+# Apr 26, 2021
+#
+# Features
+# ----------
+# - CI: Enable CI workflow.
+# - Dpvs: TC stability and performance enhancement.
+# - Dpvs: TC supports ipv6 and ingress traffic.
+# - Dpvs: Add document and examples for dpvs tc.
+# - Dpvs: Add supports for ipvs whitelist.
+# - Dpvs: Support icmp forwarding with icmp_fwd_core.
+# - Dpvs: Support mtu config.
+# - Dpvs: Obsolete dpdk 16.07 and 17.05.02.
+# - Patch: Add eal memory debug patch for dpdk-stable-18.11.2.
+# 
+# # Bugfix
+# --------
+# - Dpvs: Fix traceroute problem of dpvs ip address.
+# - Dpvs: Fix flags conflicts for ipvs conn/service/dest.
+# - Dpvs: Reset tcp connection when syn-cookie check fails.
+# - Dpvs: Use correct mbuf:l4_len for checkout offload.
+# - Dpvs: Fix udp checksum problem for uoa when checksum offload is off.
+# - Dpvs: Simplify checksum calculations and remove superfluous checksum functions.
+# - Dpvs: Refactor netif recv procedure.
+# - Dpvs: Fix debug level log problem.
+# - Keepalived: Fix problem that local ip config doesn't take effect when restart.
+# - Keepalived: Fix crash problem when tunnel is configured.
 
-export VERSION=1.6
-export RELEASE=1
+export VERSION=1.8
+export RELEASE=10
 
 echo $VERSION-$RELEASE

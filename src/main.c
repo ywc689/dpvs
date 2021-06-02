@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -15,13 +15,21 @@
  * GNU General Public License for more details.
  *
  */
+
+/*
+ * '_GNU_SOURCE' has been defined in newer DPDK's makefile
+ * (e.g., 18.11) but not in order DPDK (e.g., 17.11).
+ */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+
 #include <pthread.h>
 #include <assert.h>
 #include <getopt.h>
 #include "pidfile.h"
 #include "dpdk.h"
-#include "common.h"
+#include "conf/common.h"
 #include "netif.h"
 #include "vlan.h"
 #include "inet.h"
@@ -33,12 +41,114 @@
 #include "ipvs/ipvs.h"
 #include "cfgfile.h"
 #include "ip_tunnel.h"
+#include "sys_time.h"
 #include "route6.h"
+#include "iftraf.h"
+#include "eal_mem.h"
+#include "scheduler.h"
+#include "pdump.h"
 
 #define DPVS    "dpvs"
 #define RTE_LOGTYPE_DPVS RTE_LOGTYPE_USER1
 
 #define LCORE_CONF_BUFFER_LEN 4096
+
+#ifdef CONFIG_DPVS_PDUMP
+extern bool g_dpvs_pdump;
+#endif
+extern int log_slave_init(void);
+
+
+
+/*
+ * the initialization order of all the modules
+ */
+#define DPVS_MODULES {                                          \
+        DPVS_MODULE(MODULE_FIRST,       "scheduler",            \
+                    dpvs_scheduler_init, dpvs_scheduler_term),  \
+        DPVS_MODULE(MODULE_GLOBAL_DATA, "global data",          \
+                    global_data_init,    global_data_term),     \
+        DPVS_MODULE(MODULE_MBUF,        "mbuf",                 \
+                    mbuf_init,           NULL),                 \
+        DPVS_MODULE(MODULE_CFG,         "config file",          \
+                    cfgfile_init,        cfgfile_term),         \
+        DPVS_MODULE(MODULE_PDUMP,        "pdump",               \
+                    pdump_init,          pdump_term),           \
+        DPVS_MODULE(MODULE_NETIF_VDEV,  "vdevs",                \
+                    netif_vdevs_add,     NULL),                 \
+        DPVS_MODULE(MODULE_TIMER,       "timer",                \
+                    dpvs_timer_init,     dpvs_timer_term),      \
+        DPVS_MODULE(MODULE_TC,          "tc",                   \
+                    tc_init,             tc_term),              \
+        DPVS_MODULE(MODULE_NETIF,       "netif",                \
+                    netif_init,          netif_term),           \
+        DPVS_MODULE(MODULE_CTRL,        "ctrl",                 \
+                    ctrl_init,           ctrl_term),            \
+        DPVS_MODULE(MODULE_TC_CTRL,     "tc_ctrl",              \
+                    tc_ctrl_init,        tc_ctrl_term),         \
+        DPVS_MODULE(MODULE_VLAN,        "vlan",                 \
+                    vlan_init,           NULL),                 \
+        DPVS_MODULE(MODULE_INET,        "inet",                 \
+                    inet_init,           inet_term),            \
+        DPVS_MODULE(MODULE_SA_POOL,     "sa_pool",              \
+                    sa_pool_init,        sa_pool_term),         \
+        DPVS_MODULE(MODULE_IP_TUNNEL,   "tunnel",               \
+                    ip_tunnel_init,      ip_tunnel_term),       \
+        DPVS_MODULE(MODULE_VS,          "ipvs",                 \
+                    dp_vs_init,          dp_vs_term),           \
+        DPVS_MODULE(MODULE_NETIF_CTRL,  "netif ctrl",           \
+                    netif_ctrl_init,     netif_ctrl_term),      \
+        DPVS_MODULE(MODULE_IFTRAF,      "iftraf",               \
+                    iftraf_init,         iftraf_term),          \
+        DPVS_MODULE(MODULE_LAST,        "iftraf",               \
+                    eal_mem_init,        eal_mem_term)          \
+    }
+
+#define DPVS_MODULE(a, b, c, d)  a
+enum dpvs_modules DPVS_MODULES;
+#undef DPVS_MODULE
+
+#define DPVS_MODULE(a, b, c, d)  b
+static const char *dpvs_modules[] = DPVS_MODULES;
+#undef DPVS_MODULE
+
+typedef int (*dpvs_module_init_pt)(void);
+typedef int (*dpvs_module_term_pt)(void);
+
+#define DPVS_MODULE(a, b, c, d)  c
+dpvs_module_init_pt dpvs_module_inits[] = DPVS_MODULES;
+#undef DPVS_MODULE
+
+#define DPVS_MODULE(a, b, c, d)  d
+dpvs_module_term_pt dpvs_module_terms[] = DPVS_MODULES;
+
+static void modules_init(void)
+{
+    int m, err;
+
+    for (m = MODULE_FIRST; m <= MODULE_LAST; m++) {
+        if (dpvs_module_inits[m]) {
+            if ((err = dpvs_module_inits[m]()) != EDPVS_OK) {
+                rte_exit(EXIT_FAILURE, "failed to init %s: %s\n",
+                         dpvs_modules[m], dpvs_strerror(err));
+            }
+        }
+    }
+}
+
+static void modules_term(void)
+{
+    int m, err;
+
+    for (m = MODULE_LAST ; m >= MODULE_FIRST; m--) {
+        if (dpvs_module_terms[m]) {
+            if ((err = dpvs_module_terms[m]()) != EDPVS_OK) {
+                rte_exit(EXIT_FAILURE, "failed to term %s: %s\n",
+                         dpvs_modules[m], dpvs_strerror(err));
+            }
+        }
+    }
+}
 
 static int set_all_thread_affinity(void)
 {
@@ -55,6 +165,7 @@ static int set_all_thread_affinity(void)
 
     s = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
     if (s != 0) {
+        errno = s;
         perror("fail to set thread affinty");
         return -1;
     }
@@ -62,6 +173,7 @@ static int set_all_thread_affinity(void)
     CPU_ZERO(&cpuset);
     s = pthread_getaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
     if (s != 0) {
+        errno = s;
         perror("fail to get thread affinity");
         return -2;
     }
@@ -140,8 +252,6 @@ int main(int argc, char *argv[])
     struct timeval tv;
     char pql_conf_buf[LCORE_CONF_BUFFER_LEN];
     int pql_conf_buf_len = LCORE_CONF_BUFFER_LEN;
-    uint32_t loop_cnt = 0;
-    int timer_sched_loop_interval;
 
     /**
      * add application agruments parse before EAL ones.
@@ -167,6 +277,7 @@ int main(int argc, char *argv[])
 
     gettimeofday(&tv, NULL);
     srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
+    sys_start_time();
 
     if (get_numa_nodes() > DPVS_MAX_SOCKET) {
         fprintf(stderr, "DPVS_MAX_SOCKET is smaller than system numa nodes!\n");
@@ -181,61 +292,15 @@ int main(int argc, char *argv[])
     err = rte_eal_init(argc, argv);
     if (err < 0)
         rte_exit(EXIT_FAILURE, "Invalid EAL parameters\n");
-    argc -= err, argv += err;
 
     RTE_LOG(INFO, DPVS, "dpvs version: %s, build on %s\n", DPVS_VERSION, DPVS_BUILD_DATE);
 
     rte_timer_subsystem_init();
 
-    if ((err = cfgfile_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail init configuration file: %s\n",
-                 dpvs_strerror(err));
-
-    if ((err = netif_virtual_devices_add()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail add virtual devices:%s\n",
-                 dpvs_strerror(err));
-
-    if ((err = dpvs_timer_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail init timer on %s\n", dpvs_strerror(err));
-
-    if ((err = tc_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init traffic control: %s\n",
-                 dpvs_strerror(err));
-
-    if ((err = netif_init(NULL)) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init netif: %s\n", dpvs_strerror(err));
-    /* Default lcore conf and port conf are used and may be changed here 
-     * with "netif_port_conf_update" and "netif_lcore_conf_set" */
-
-    if ((err = ctrl_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init ctrl plane: %s\n",
-                 dpvs_strerror(err));
-
-    if ((err = tc_ctrl_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init tc control plane: %s\n",
-                 dpvs_strerror(err));
-
-    if ((err = vlan_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init vlan: %s\n", dpvs_strerror(err));
-
-    if ((err = inet_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init inet: %s\n", dpvs_strerror(err));
-
-    if ((err = sa_pool_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init sa_pool: %s\n", dpvs_strerror(err));
-
-    if ((err = ip_tunnel_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init tunnel: %s\n", dpvs_strerror(err));
-
-    if ((err = dp_vs_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init ipvs: %s\n", dpvs_strerror(err));
-
-    if ((err = netif_ctrl_init()) != EDPVS_OK)
-        rte_exit(EXIT_FAILURE, "Fail to init netif_ctrl: %s\n",
-                 dpvs_strerror(err));
+    modules_init();
 
     /* config and start all available dpdk ports */
-    nports = rte_eth_dev_count();
+    nports = dpvs_rte_eth_dev_count();
     for (pid = 0; pid < nports; pid++) {
         dev = netif_port_get(pid);
         if (!dev) {
@@ -254,63 +319,24 @@ int main(int argc, char *argv[])
     RTE_LOG(INFO, DPVS, "\nport-queue-lcore relation array: \n%s\n",
             pql_conf_buf);
 
-    /* start data plane threads */
-    netif_lcore_start();
+    log_slave_init();
+
+    /* start slave worker threads */
+    dpvs_lcore_start(0);
 
     /* write pid file */
     if (!pidfile_write(DPVS_PIDFILE, getpid()))
         goto end;
 
-    timer_sched_loop_interval = dpvs_timer_sched_interval_get();
-    assert(timer_sched_loop_interval > 0);
-
     dpvs_state_set(DPVS_STATE_NORMAL);
 
-    /* start control plane thread */
-    while (1) {
-        /* reload configuations if reload flag is set */
-        try_reload();
-        /* IPC loop */
-        sockopt_ctl(NULL);
-        /* msg loop */
-        msg_master_process();
-
-        /* timer */
-        loop_cnt++;
-        if (loop_cnt % timer_sched_loop_interval == 0)
-            rte_timer_manage();
-        /* kni */
-        kni_process_on_master();
-
-        /* process mac ring on master */
-        neigh_process_ring(NULL);
- 
-        /* increase loop counts */
-        netif_update_master_loop_cnt();
-    }
+    /* start control plane thread loop */
+    dpvs_lcore_start(1);
 
 end:
     dpvs_state_set(DPVS_STATE_FINISH);
-    if ((err = netif_ctrl_term()) !=0 )
-        rte_exit(EXIT_FAILURE, "Fail to term netif_ctrl: %s\n",
-                 dpvs_strerror(err));
-    if ((err = dp_vs_term()) != EDPVS_OK)
-        RTE_LOG(ERR, DPVS, "Fail to term ipvs: %s\n", dpvs_strerror(err));
-    if ((err = ip_tunnel_term()) != EDPVS_OK)
-        RTE_LOG(ERR, DPVS, "Fail to term tunnel: %s\n", dpvs_strerror(err));
-    if ((err = sa_pool_term()) != EDPVS_OK)
-        RTE_LOG(ERR, DPVS, "Fail to term sa_pool: %s\n", dpvs_strerror(err));
-    if ((err = inet_term()) != EDPVS_OK)
-        RTE_LOG(ERR, DPVS, "Fail to term inet: %s\n", dpvs_strerror(err));
-    if ((err = dpvs_timer_term()) != EDPVS_OK)
-        RTE_LOG(ERR, DPVS, "Fail to term timer: %s\n", dpvs_strerror(err));
-    if ((err = ctrl_term()) != 0)
-        RTE_LOG(ERR, DPVS, "Fail to term ctrl plane\n");
-    if ((err = netif_term()) != 0)
-        RTE_LOG(ERR, DPVS, "Fail to term netif\n");
-    if ((err = cfgfile_term()) != 0)
-        RTE_LOG(ERR, DPVS, "Fail to term configuration file: %s\n",
-                dpvs_strerror(err));
+    modules_term();
+
     pidfile_rm(DPVS_PIDFILE);
 
     exit(0);

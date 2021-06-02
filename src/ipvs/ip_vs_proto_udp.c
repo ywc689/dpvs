@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -18,17 +18,19 @@
 #include <assert.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
-#include <netinet/udp.h>
-#include "common.h"
+#include "conf/common.h"
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "route6.h"
 #include "ipvs/ipvs.h"
 #include "ipvs/proto.h"
 #include "ipvs/proto_udp.h"
 #include "ipvs/conn.h"
 #include "ipvs/service.h"
 #include "ipvs/blklst.h"
+#include "ipvs/whtlst.h"
+#include "ipvs/redirect.h"
 #include "parser/parser.h"
 #include "uoa.h"
 #include "neigh.h"
@@ -61,14 +63,95 @@ static int udp_timeouts[DPVS_UDP_S_LAST + 1] = {
     [DPVS_UDP_S_LAST]   = 2,
 };
 
+inline void udp4_send_csum(struct rte_ipv4_hdr *iph, struct rte_udp_hdr *uh)
+{
+    uh->dgram_cksum = 0;
+    uh->dgram_cksum = rte_ipv4_udptcp_cksum(iph, uh);
+}
+
+inline void udp6_send_csum(struct rte_ipv6_hdr *iph, struct rte_udp_hdr *uh)
+{
+    uh->dgram_cksum = 0;
+    uh->dgram_cksum = ip6_udptcp_cksum((struct ip6_hdr *)iph, (struct udphdr *)uh,
+            (void *)uh - (void *)iph, IPPROTO_UDP);
+}
+
+static inline int udp_send_csum(int af, int iphdrlen, struct rte_udp_hdr *uh,
+                                const struct dp_vs_conn *conn,
+                                struct rte_mbuf *mbuf, const struct opphdr *opp)
+{
+    /* leverage HW TX UDP csum offload if possible */
+
+    struct netif_port *dev = NULL;
+
+    if (AF_INET6 == af) {
+        /* UDP checksum is mandatory for IPv6.[RFC 2460] */
+        struct ip6_hdr *ip6h = ip6_hdr(mbuf);
+        if (unlikely(opp != NULL)) {
+            udp6_send_csum((struct rte_ipv6_hdr*)ip6h, uh);
+        } else {
+            struct route6 *rt6 = MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE);
+            if (rt6 && rt6->rt6_dev)
+                dev = rt6->rt6_dev;
+            else if (conn->out_dev)
+                dev = conn->out_dev;
+            if (likely(dev && (dev->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD))) {
+                mbuf->l3_len = iphdrlen;
+                mbuf->l4_len = sizeof(struct rte_udp_hdr);
+                mbuf->ol_flags |= (PKT_TX_UDP_CKSUM | PKT_TX_IPV6);
+                uh->dgram_cksum = ip6_phdr_cksum(ip6h, mbuf->ol_flags,
+                        iphdrlen, IPPROTO_UDP);
+            } else {
+                if (mbuf_may_pull(mbuf, mbuf->pkt_len) != 0)
+                    return EDPVS_INVPKT;
+                udp6_send_csum((struct rte_ipv6_hdr*)ip6h, uh);
+            }
+        }
+    } else { /* AF_INET */
+        /* UDP checksum is not mandatory for IPv4. */
+        struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
+        if (unlikely(opp != NULL)) {
+            /*
+             * XXX: UDP pseudo header need UDP length, but the common helper function
+             * rte_ipv4_udptcp_cksum() use (IP.tot_len - IP.header_len), it's not
+             * correct if OPP header insterted between IP header and UDP header.
+             * We can modify the function, or change IP.tot_len before use
+             * rte_ipv4_udptcp_cksum() and restore it after.
+             *
+             * However, UDP checksum is not mandatory, to make things easier, when OPP
+             * header exist, we just not calc UDP checksum.
+             */
+            uh->dgram_cksum = 0;
+        } else {
+            struct route_entry *rt = MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE);
+            if (rt && rt->port)
+                dev = rt->port;
+            else if (conn->out_dev)
+                dev = conn->out_dev;
+            if (likely(dev && (dev->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD))) {
+                mbuf->l3_len = iphdrlen;
+                mbuf->l4_len = sizeof(struct rte_udp_hdr);
+                mbuf->ol_flags |= (PKT_TX_UDP_CKSUM | PKT_TX_IP_CKSUM | PKT_TX_IPV4);
+                uh->dgram_cksum = rte_ipv4_phdr_cksum(iph, mbuf->ol_flags);
+            } else {
+                if (mbuf_may_pull(mbuf, mbuf->pkt_len) != 0)
+                    return EDPVS_INVPKT;
+                udp4_send_csum(iph, uh);
+            }
+        }
+    }
+    return EDPVS_OK;
+}
+
 static int udp_conn_sched(struct dp_vs_proto *proto,
                         const struct dp_vs_iphdr *iph,
                         struct rte_mbuf *mbuf,
                         struct dp_vs_conn **conn,
                         int *verdict)
 {
-    struct udp_hdr *uh, _udph;
+    struct rte_udp_hdr *uh, _udph;
     struct dp_vs_service *svc;
+    bool outwall = false;
     assert(proto && iph && mbuf && conn && verdict);
 
     uh = mbuf_header_pointer(mbuf, iph->len, sizeof(_udph), &_udph);
@@ -78,17 +161,16 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
     }
 
     /* lookup service <vip:vport> */
-    svc = dp_vs_service_lookup(iph->af, iph->proto,
-                               &iph->daddr, uh->dst_port, 0, mbuf, NULL);
+    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, 
+                     uh->dst_port, 0, mbuf, NULL, &outwall, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
         return EDPVS_NOSERV;
     }
 
     /* schedule RS and create new connection */
-    *conn = dp_vs_schedule(svc, iph, mbuf, false);
+    *conn = dp_vs_schedule(svc, iph, mbuf, false, outwall);
     if (!*conn) {
-        dp_vs_service_put(svc);
         *verdict = INET_DROP;
         return EDPVS_RESOURCE;
     }
@@ -108,7 +190,6 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
         }
     }
 
-    dp_vs_service_put(svc);
     return EDPVS_OK;
 }
 
@@ -116,9 +197,9 @@ static struct dp_vs_conn *
 udp_conn_lookup(struct dp_vs_proto *proto,
                 const struct dp_vs_iphdr *iph,
                 struct rte_mbuf *mbuf, int *direct,
-                bool reverse, bool *drop)
+                bool reverse, bool *drop, lcoreid_t *peer_cid)
 {
-    struct udp_hdr *uh, _udph;
+    struct rte_udp_hdr *uh, _udph;
     struct dp_vs_conn *conn;
     assert(proto && iph && mbuf);
 
@@ -126,15 +207,21 @@ udp_conn_lookup(struct dp_vs_proto *proto,
     if (unlikely(!uh))
         return NULL;
 
-    if (dp_vs_blklst_lookup(iph->proto, &iph->daddr, uh->dst_port,
-                            &iph->saddr)) {
+    if (dp_vs_blklst_lookup(iph->af, iph->proto, &iph->daddr,
+                uh->dst_port, &iph->saddr)) {
         *drop = true;
         return NULL;
-    }  
+    }
 
-    conn = dp_vs_conn_get(iph->af, iph->proto, 
-                          &iph->saddr, &iph->daddr, 
-                          uh->src_port, uh->dst_port, 
+    if (!dp_vs_whtlst_allow(iph->af, iph->proto, &iph->daddr, 
+							uh->dst_port, &iph->saddr)) {
+        *drop = true;
+        return NULL;
+    }
+
+    conn = dp_vs_conn_get(iph->af, iph->proto,
+                          &iph->saddr, &iph->daddr,
+                          uh->src_port, uh->dst_port,
                           direct, reverse);
 
     /*
@@ -144,16 +231,18 @@ udp_conn_lookup(struct dp_vs_proto *proto,
      */
     int af = iph->af;
     if (conn != NULL) {
-        if (AF_INET6 == af) {
-            if ((*direct == DPVS_CONN_DIR_OUTBOUND) && conn->in_dev
-                        && !ipv6_addr_any(&conn->in_nexthop.in6)) {
-                neigh_confirm(AF_INET6, &conn->in_nexthop, conn->in_dev);
-            }
-        } else {
-            if ((*direct == DPVS_CONN_DIR_OUTBOUND) && conn->in_dev
-                       && (conn->in_nexthop.in.s_addr != htonl(INADDR_ANY))) {
-                neigh_confirm(AF_INET, &conn->in_nexthop, conn->in_dev);
-            }
+        if ((*direct == DPVS_CONN_DIR_OUTBOUND) && conn->in_dev
+             && (!inet_is_addr_any(tuplehash_out(conn).af, &conn->in_nexthop))) {
+            neigh_confirm(tuplehash_out(conn).af, &conn->in_nexthop, conn->in_dev);
+        }
+    } else {
+        struct dp_vs_redirect *r;
+
+        r = dp_vs_redirect_get(iph->af, iph->proto,
+                               &iph->saddr, &iph->daddr,
+                               uh->src_port, uh->dst_port);
+        if (r) {
+            *peer_cid = r->cid;
         }
     }
 
@@ -168,11 +257,18 @@ static int udp_conn_expire(struct dp_vs_proto *proto, struct dp_vs_conn *conn)
     return EDPVS_OK;
 }
 
+static int udp_conn_expire_quiescent(struct dp_vs_conn *conn)
+{
+    dp_vs_conn_expire_now(conn);
+
+    return EDPVS_OK;
+}
+
 static int udp_state_trans(struct dp_vs_proto *proto, struct dp_vs_conn *conn,
                            struct rte_mbuf *mbuf, int dir)
 {
     conn->state = DPVS_UDP_S_NORMAL;
-    conn->timeout.tv_sec = udp_timeouts[conn->state];
+    dp_vs_conn_set_timeout(conn, proto);
     return EDPVS_OK;
 }
 
@@ -183,14 +279,15 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
                                enum uoa_mode mode)
 {
     struct rte_mbuf *mbuf = NULL;
-    struct route_entry *rt;
     void *iph;
     struct udphdr *uh;
     struct ipopt_uoa *uoa = NULL;
     struct opphdr *opp;
-    int af = conn->af;
+    int iaf = tuplehash_in(conn).af;
+    int oaf = tuplehash_out(conn).af;
 
-    assert(conn && ombuf && oiph && ouh && ombuf->userdata);
+    assert(conn && ombuf && oiph && ouh &&
+            MBUF_USERDATA_CONST(ombuf, void *, MBUF_FIELD_ROUTE));
 
     /* just in case */
     if (unlikely(conn->dest->fwdmode != DPVS_FWD_MODE_FNAT))
@@ -199,29 +296,30 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     mbuf = rte_pktmbuf_alloc(ombuf->pool);
     if (unlikely(!mbuf))
         return EDPVS_NOMEM;
+    MBUF_USERDATA(mbuf, void *, MBUF_FIELD_ROUTE) = NULL;
+
+    int ipolen_uoa = (AF_INET6 == iaf) ? IPOLEN_UOA_IPV6 : IPOLEN_UOA_IPV4;
 
     int ipolen_uoa = (AF_INET6 == af) ? IPOLEN_UOA_IPV6 : IPOLEN_UOA_IPV4;
 
     /* don't copy any ip options from oiph, is it ok ? */
-    if (AF_INET6 == af) {
+    if (AF_INET6 == oaf) {
         iph = (void *)rte_pktmbuf_append(mbuf, sizeof(struct ip6_hdr));
         if (unlikely(!iph))
             goto no_room;
         ((struct ip6_hdr *)iph)->ip6_ctlun
                                       = ((struct ip6_hdr *)oiph)->ip6_ctlun;
-        memcpy(&((struct ip6_hdr *)iph)->ip6_src,
-                                      &((struct ip6_hdr *)oiph)->ip6_src,
-                                      IPV6_ADDR_LEN_IN_BYTES);
-        memcpy(&((struct ip6_hdr *)iph)->ip6_dst,
-                                      &((struct ip6_hdr *)oiph)->ip6_dst,
-                                      IPV6_ADDR_LEN_IN_BYTES);
+        memcpy(&((struct ip6_hdr *)iph)->ip6_src, &conn->laddr.in6,
+                                                  sizeof(struct in6_addr));
+        memcpy(&((struct ip6_hdr *)iph)->ip6_dst, &conn->daddr.in6,
+                                                  sizeof(struct in6_addr));
     } else {
         iph = (void *)rte_pktmbuf_append(mbuf, sizeof(struct iphdr));
         if (unlikely(!iph))
             goto no_room;
         ((struct iphdr *)iph)->version = 4;
         ((struct iphdr *)iph)->tos     = ((struct iphdr *)oiph)->tos;
-        ((struct iphdr *)iph)->id      = ip4_select_id((struct ipv4_hdr *)iph);
+        ((struct iphdr *)iph)->id      = ip4_select_id((struct rte_ipv4_hdr *)iph);
         ((struct iphdr *)iph)->frag_off = 0;
         ((struct iphdr *)iph)->ttl     = ((struct iphdr *)oiph)->ttl;
         ((struct iphdr *)iph)->saddr   = conn->laddr.in.s_addr;
@@ -230,6 +328,10 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
 
     if (mode == UOA_M_IPO) {
         /* only ipv4 support and use this ip option mode */
+        if (iaf != AF_INET || oaf != AF_INET) {
+            rte_pktmbuf_free(mbuf);
+            return EDPVS_NOTSUPP;
+        }
         ((struct iphdr *)iph)->ihl =
             (sizeof(struct iphdr) + IPOLEN_UOA_IPV4) / 4;
         ((struct iphdr *)iph)->tot_len  =
@@ -239,14 +341,14 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
         uoa = (void *)rte_pktmbuf_append(mbuf, ipolen_uoa);
     } else {
         /* UOA_M_OPP */
-        if (AF_INET6 == af) {
+        if (AF_INET6 == oaf) {
             ((struct ip6_hdr *)iph)->ip6_plen =
-                                sizeof(*opp) + sizeof(*uoa) + sizeof(*uh);
+                                htons(sizeof(*opp) + ipolen_uoa + sizeof(*uh));
             ((struct ip6_hdr *)iph)->ip6_nxt = IPPROTO_OPT;
         } else {
             ((struct iphdr *)iph)->ihl = sizeof(struct iphdr) / 4;
             ((struct iphdr *)iph)->tot_len = htons(sizeof(struct iphdr) +
-                                sizeof(*opp) + sizeof(*uoa) + sizeof(*uh));
+                                sizeof(*opp) + ipolen_uoa + sizeof(*uh));
             ((struct iphdr *)iph)->protocol = IPPROTO_OPT;
         }
 
@@ -256,13 +358,8 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
             goto no_room;
 
         memset(opp, 0, sizeof(*opp));
-        if (AF_INET6 == af) {
-            opp->version  = OPPHDR_IPV6;
-            opp->protocol = IPPROTO_UDP; /* set to IPPROTO_UDP */
-        } else {
-            opp->version  = OPPHDR_IPV4;
-            opp->protocol = IPPROTO_UDP;
-        }
+        opp->version = (AF_INET6 == iaf) ? OPPHDR_IPV6 : OPPHDR_IPV4;
+        opp->protocol = IPPROTO_UDP; /* set to IPPROTO_UDP */
         opp->length = htons(sizeof(*opp) + ipolen_uoa);
 
         uoa = (void *)rte_pktmbuf_append(mbuf, ipolen_uoa);
@@ -277,7 +374,7 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     uoa->op_len  = ipolen_uoa;
     uoa->op_port = ouh->source;
     /* fix uoa->op_addr */
-    if (AF_INET6 == af) {
+    if (AF_INET6 == iaf) {
         memcpy(&uoa->op_addr, &((struct ip6_hdr *)oiph)->ip6_src,
                                IPV6_ADDR_LEN_IN_BYTES);
     } else {
@@ -295,15 +392,28 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     uh->dest   = conn->dport;
     uh->len    = htons(sizeof(struct udphdr)); /* empty payload */
 
-    /* udp checksum */
-    uh->check  = 0; /* rte_ipv4_udptcp_cksum fails if opp inserted. */
-
     /* ip checksum will calc later */
 
-    mbuf->userdata = rt = (struct route_entry *)ombuf->userdata;
-    route4_get(rt);
-
-    return ipv4_local_out(mbuf);
+    if (AF_INET6 == oaf) {
+        struct route6 *rt6;
+        /*
+         * IPv6 UDP checksum is a must, packets with OPP header also need checksum.
+         * if udp checksum error here, may cause tcpdump & uoa moudule parse packets
+         * correctly, however socket can not receive L4 data.
+         */
+        udp6_send_csum((struct rte_ipv6_hdr *)iph, (struct rte_udp_hdr*)uh);
+        rt6 = MBUF_USERDATA_CONST(ombuf, struct route6 *, MBUF_FIELD_ROUTE);
+        MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE) = rt6;
+        route6_get(rt6);
+        return ip6_local_out(mbuf);
+    } else { /* IPv4 */
+        struct route_entry *rt;
+        uh->check  = 0; /* rte_ipv4_udptcp_cksum fails if opp inserted. */
+        rt = MBUF_USERDATA_CONST(ombuf, struct route_entry *, MBUF_FIELD_ROUTE);
+        MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
+        route4_get(rt);
+        return ipv4_local_out(mbuf);
+    }
 
 no_room:
     if (mbuf)
@@ -317,8 +427,10 @@ static int insert_ipopt_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
     struct iphdr *niph = NULL;
     struct ipopt_uoa *optuoa;
 
-    if ((ip4_hdrlen(mbuf) + sizeof(struct ipopt_uoa) > MAX_IPOPTLEN) ||
-            (mbuf->pkt_len + sizeof(struct ipopt_uoa) > mtu))
+    assert(AF_INET == tuplehash_in(conn).af && AF_INET == tuplehash_out(conn).af);
+    if ((ip4_hdrlen(mbuf) + sizeof(struct ipopt_uoa) >
+                sizeof(struct iphdr) + MAX_IPOPTLEN)
+            || (mbuf->pkt_len + sizeof(struct ipopt_uoa) > mtu))
         goto standalone_uoa;
 
     /*
@@ -381,16 +493,22 @@ static int insert_opp_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
     void *niph;
     struct opphdr *opph   = NULL;
     struct ipopt_uoa *uoa = NULL;
-    int af = conn->af;
     int iphdrlen = 0, iptot_len = 0, ipolen_uoa = 0;
+
+    /* the current af of mbuf before possible nat64,
+     * i.e. the "tuplehash_in(conn).af" for FullNAT */
+    int af = conn->af;
+
     if (AF_INET6 == af) {
         /*
-         * iphdrlen:  ipv6 total header length = basic header length (40 B) +
-         *                                       ext header length
-         * iptot_len: ipv6 total length = basic header length (40 B) +
-         *                                payload length(including ext header)
+         * iphdrlen:  ipv6 total header length =
+         *   basic header length (40 B) + ext header length
+         * iptot_len: ipv6 total length =
+         *   basic header length (40 B) + payload length(including ext header)
          */
         iphdrlen   = ip6_hdrlen(mbuf);
+        if (iphdrlen != sizeof(struct rte_ipv6_hdr))
+            goto standalone_uoa;
         iptot_len  = sizeof(struct ip6_hdr) +
                      ntohs(((struct ip6_hdr *)iph)->ip6_plen);
         ipolen_uoa = IPOLEN_UOA_IPV6;
@@ -437,8 +555,6 @@ static int insert_opp_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
     opph = (struct opphdr *)((void *)niph + iphdrlen);
     memset(opph, 0, sizeof(*opph));
 
-
-
     if (AF_INET6 == af) {
         /* version 2 for ipv6 address family */
         uint8_t nexthdr = ((struct ip6_hdr *)niph)->ip6_nxt;
@@ -453,13 +569,19 @@ static int insert_opp_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
     opph->length = htons(sizeof(*opph) + ipolen_uoa);
 
     uoa = (void *)opph->options;
-    memset(uoa, 0, sizeof(struct ipopt_uoa));
+    memset(uoa, 0, ipolen_uoa);
     uoa->op_code = IPOPT_UOA;
     uoa->op_len  = ipolen_uoa;
     uoa->op_port = uh->source;
     if (AF_INET6 == af) {
-        memcpy(&uoa->op_addr, &((struct ip6_hdr *)niph)->ip6_src, 
+        memcpy(&uoa->op_addr, &((struct ip6_hdr *)niph)->ip6_src,
                                                     IPV6_ADDR_LEN_IN_BYTES);
+        /*
+         * we should set the 'nexthdr' of the last ext header to IPPROTO_OPT here
+         * but seems no efficient method to set that one
+         * ip6_skip_exthdr was only used to get the value
+         * so we send_standalone_uoa when has ip ext headers
+         */
         ((struct ip6_hdr *)niph)->ip6_nxt = IPPROTO_OPT;
         /* Update ipv6 payload length */
         ((struct ip6_hdr *)niph)->ip6_plen =
@@ -483,20 +605,13 @@ standalone_uoa:
 static int udp_insert_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
                           struct conn_uoa *uoa)
 {
-    struct route_entry *rt = NULL;
+    void *rt = NULL;
     struct udphdr *uh = NULL;
     void *iph = NULL;
     int af = conn->af;
     int iphdrlen = 0;
     int err = EDPVS_OK;
-
-    if (AF_INET6 == af) {
-        iph = ip6_hdr(mbuf);
-        iphdrlen = ip6_hdrlen(mbuf);
-    } else {
-        iph = (struct iphdr *)ip4_hdr(mbuf);
-        iphdrlen = ip4_hdrlen(mbuf);
-    }
+    int mtu;
 
     /* already send enough UOA */
     if (uoa->state == UOA_S_DONE)
@@ -509,14 +624,24 @@ static int udp_insert_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
         return EDPVS_OK;
     }
 
-    /* get udp header before any 'standalone_uoa' */
-    uh = rte_pktmbuf_mtod_offset(mbuf, struct udphdr *, iphdrlen);
-
-    rt = mbuf->userdata;
+    rt = MBUF_USERDATA(mbuf, void *, MBUF_FIELD_ROUTE);
     if (!rt) {
         RTE_LOG(ERR, IPVS, "%s: no route\n", __func__);
         return EDPVS_INVPKT;
     }
+
+    if (AF_INET6 == tuplehash_out(conn).af) {
+        mtu = ((struct route6*)rt)->rt6_mtu;
+        iph = ip6_hdr(mbuf);
+        iphdrlen = ip6_hdrlen(mbuf);
+    } else {
+        mtu = ((struct route_entry*) rt)->mtu;
+        iph = (struct iphdr *)ip4_hdr(mbuf);
+        iphdrlen = ip4_hdrlen(mbuf);
+    }
+
+    /* get udp header before any 'standalone_uoa' */
+    uh = rte_pktmbuf_mtod_offset(mbuf, struct udphdr *, iphdrlen);
 
     /*
      * send standalone (empty-payload) UDP/IP pkt with UOA if
@@ -532,14 +657,14 @@ static int udp_insert_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
         case UOA_M_IPO:
             /* only ipv4 support ipopt mode */
             if (AF_INET == af) {
-                err = insert_ipopt_uoa(conn, mbuf, (struct iphdr *)iph, uh, rt->mtu);
+                err = insert_ipopt_uoa(conn, mbuf, (struct iphdr *)iph, uh, mtu);
             } else {
                 RTE_LOG(WARNING, IPVS, "fail to send UOA: %s\n", dpvs_strerror(err));
             }
             break;
 
         case UOA_M_OPP:
-            err = insert_opp_uoa(conn, mbuf, iph, uh, rt->mtu);
+            err = insert_opp_uoa(conn, mbuf, iph, uh, mtu);
             break;
 
         default:
@@ -558,10 +683,11 @@ static int udp_fnat_in_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh = NULL;
+    struct rte_udp_hdr *uh = NULL;
     struct opphdr *opp = NULL;
     void *iph = NULL;
-    int af = conn->af;
+    /* af/mbuf may be changed for nat64 which in af is ipv6 and out is ipv4 */
+    int af = tuplehash_out(conn).af;
     int iphdrlen = 0;
     uint8_t nxt_proto;
 
@@ -579,14 +705,14 @@ static int udp_fnat_in_handler(struct dp_vs_proto *proto,
     }
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
 
     if (nxt_proto == IPPROTO_UDP) {
-        uh = (struct udp_hdr *)(iph + iphdrlen);
+        uh = (struct rte_udp_hdr *)(iph + iphdrlen);
     } else if (nxt_proto == IPPROTO_OPT) {
         opp = (struct opphdr *)(iph + iphdrlen);
-        uh  = (struct udp_hdr *)((void *)opp + ntohs(opp->length));
+        uh  = (struct rte_udp_hdr *)((void *)opp + ntohs(opp->length));
     }
 
     if (unlikely(!uh))
@@ -595,57 +721,29 @@ static int udp_fnat_in_handler(struct dp_vs_proto *proto,
     uh->src_port = conn->lport;
     uh->dst_port = conn->dport;
 
-    uh->dgram_cksum = 0;
-
-    /*
-     * XXX: UDP pseudo header need UDP length, but the common helper function
-     * rte_ipv4_udptcp_cksum() use (IP.tot_len - IP.header_len), it's not
-     * correct if OPP header insterted between IP header and UDP header.
-     * We can modify the function, or change IP.tot_len before use
-     * rte_ipv4_udptcp_cksum() and restore it after.
-     *
-     * However, UDP checksum is not mandatory, to make things easier, when OPP
-     * header exist, we just not calc UDP checksum.
-     */
-    if (!opp) {
-        if (AF_INET6 == af) {
-            uh->dgram_cksum =
-                rte_ipv6_udptcp_cksum((struct ipv6_hdr *)ip6_hdr(mbuf), uh);
-        } else {
-            uh->dgram_cksum = rte_ipv4_udptcp_cksum(ip4_hdr(mbuf), uh);
-        }
-    }
-
-    return EDPVS_OK;
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, opp);
 }
 
 static int udp_fnat_out_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh;
-    int af = conn->af;
+    struct rte_udp_hdr *uh;
+    /* af/mbuf may be changed for nat64 which in af is ipv6 and out is ipv4 */
+    int af = tuplehash_in(conn).af;
     int iphdrlen = ((AF_INET6 == af) ? ip6_hdrlen(mbuf): ip4_hdrlen(mbuf));
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
-    uh = rte_pktmbuf_mtod_offset(mbuf, struct udp_hdr *, iphdrlen);
+    uh = rte_pktmbuf_mtod_offset(mbuf, struct rte_udp_hdr *, iphdrlen);
     if (unlikely(!uh))
         return EDPVS_INVPKT;
 
     uh->src_port = conn->vport;
     uh->dst_port = conn->cport;
 
-    uh->dgram_cksum = 0;
-    if (AF_INET6 == af) {
-        uh->dgram_cksum =
-            rte_ipv6_udptcp_cksum((struct ipv6_hdr *)ip6_hdr(mbuf), uh);
-    } else {
-        uh->dgram_cksum = rte_ipv4_udptcp_cksum(ip4_hdr(mbuf), uh);
-    }
-
-    return EDPVS_OK;
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL);
 }
 
 static int udp_fnat_in_pre_handler(struct dp_vs_proto *proto,
@@ -664,72 +762,58 @@ static int udp_snat_in_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh;
+    struct rte_udp_hdr *uh;
     int af = conn->af;
     int iphdrlen = ((AF_INET6 == af) ? ip6_hdrlen(mbuf): ip4_hdrlen(mbuf));
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
-    uh = rte_pktmbuf_mtod_offset(mbuf, struct udp_hdr *, iphdrlen);
+    uh = rte_pktmbuf_mtod_offset(mbuf, struct rte_udp_hdr *, iphdrlen);
     if (unlikely(!uh))
         return EDPVS_INVPKT;
 
-    uh->dst_port    = conn->dport;
+    uh->dst_port = conn->dport;
 
-    uh->dgram_cksum = 0;
-    if (AF_INET6 == af) {
-        uh->dgram_cksum =
-            rte_ipv6_udptcp_cksum((struct ipv6_hdr *)ip6_hdr(mbuf), uh);
-    } else {
-        uh->dgram_cksum = rte_ipv4_udptcp_cksum(ip4_hdr(mbuf), uh);
-    }
-
-    return EDPVS_OK;
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL);
 }
 
 static int udp_snat_out_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh;
+    struct rte_udp_hdr *uh;
     int af = conn->af;
     int iphdrlen = ((AF_INET6 == af) ? ip6_hdrlen(mbuf): ip4_hdrlen(mbuf));
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
-    uh = rte_pktmbuf_mtod_offset(mbuf, struct udp_hdr *, iphdrlen);
+    uh = rte_pktmbuf_mtod_offset(mbuf, struct rte_udp_hdr *, iphdrlen);
     if (unlikely(!uh))
         return EDPVS_INVPKT;
 
-    uh->src_port    = conn->vport;
+    uh->src_port = conn->vport;
 
-    uh->dgram_cksum = 0;
-    if (AF_INET6 == af) {
-        uh->dgram_cksum =
-            rte_ipv6_udptcp_cksum((struct ipv6_hdr *)ip6_hdr(mbuf), uh);
-    } else {
-        uh->dgram_cksum = rte_ipv4_udptcp_cksum(ip4_hdr(mbuf), uh);
-    }
-
-    return EDPVS_OK;
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL);
 }
 
 struct dp_vs_proto dp_vs_proto_udp = {
-    .name               = "UDP",
-    .proto              = IPPROTO_UDP,
-    .conn_sched         = udp_conn_sched,
-    .conn_lookup        = udp_conn_lookup,
-    .conn_expire        = udp_conn_expire,
-    .state_trans        = udp_state_trans,
-    .nat_in_handler     = udp_snat_in_handler,
-    .nat_out_handler    = udp_snat_out_handler,
-    .fnat_in_handler    = udp_fnat_in_handler,
-    .fnat_out_handler   = udp_fnat_out_handler,
-    .fnat_in_pre_handler= udp_fnat_in_pre_handler,
-    .snat_in_handler    = udp_snat_in_handler,
-    .snat_out_handler   = udp_snat_out_handler,
+    .name                  = "UDP",
+    .proto                 = IPPROTO_UDP,
+    .timeout_table         = udp_timeouts,
+    .conn_sched            = udp_conn_sched,
+    .conn_lookup           = udp_conn_lookup,
+    .conn_expire           = udp_conn_expire,
+    .conn_expire_quiescent = udp_conn_expire_quiescent,
+    .state_trans           = udp_state_trans,
+    .nat_in_handler        = udp_snat_in_handler,
+    .nat_out_handler       = udp_snat_out_handler,
+    .fnat_in_handler       = udp_fnat_in_handler,
+    .fnat_out_handler      = udp_fnat_out_handler,
+    .fnat_in_pre_handler   = udp_fnat_in_pre_handler,
+    .snat_in_handler       = udp_snat_in_handler,
+    .snat_out_handler      = udp_snat_out_handler,
 };
 
 static void defence_udp_drop_handler(vector_t tokens)

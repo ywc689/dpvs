@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -16,7 +16,7 @@
  *
  */
 #include <assert.h>
-#include "common.h"
+#include "conf/common.h"
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipvs/ipvs.h"
@@ -42,7 +42,7 @@ static int proto_register(struct dp_vs_proto *proto)
 
     if (proto->init)
         proto->init(proto);
-    
+
     return EDPVS_OK;
 }
 
@@ -57,7 +57,7 @@ static int proto_unregister(struct dp_vs_proto *proto)
 
     if (proto->exit)
         proto->exit(proto);
-    
+
     return EDPVS_OK;
 }
 
@@ -72,6 +72,7 @@ struct dp_vs_proto *dp_vs_proto_lookup(uint8_t proto)
 extern struct dp_vs_proto dp_vs_proto_udp;
 extern struct dp_vs_proto dp_vs_proto_tcp;
 extern struct dp_vs_proto dp_vs_proto_icmp;
+extern struct dp_vs_proto dp_vs_proto_icmp6;
 
 int dp_vs_proto_init(void)
 {
@@ -87,6 +88,11 @@ int dp_vs_proto_init(void)
         goto tcp_error;
     }
 
+    if ((err = proto_register(&dp_vs_proto_icmp6)) != EDPVS_OK) {
+        RTE_LOG(ERR, IPVS, "%s: fail to register ICMPV6\n", __func__);
+        goto icmp6_error;
+    }
+
     if ((err = proto_register(&dp_vs_proto_icmp)) != EDPVS_OK) {
         RTE_LOG(ERR, IPVS, "%s: fail to register ICMP\n", __func__);
         goto icmp_error;
@@ -95,6 +101,8 @@ int dp_vs_proto_init(void)
     return EDPVS_OK;
 
 icmp_error:
+    proto_unregister(&dp_vs_proto_icmp6);
+icmp6_error:
     proto_unregister(&dp_vs_proto_tcp);
 tcp_error:
     proto_unregister(&dp_vs_proto_udp);
@@ -105,6 +113,9 @@ int dp_vs_proto_term(void)
 {
     if (proto_unregister(&dp_vs_proto_icmp) != EDPVS_OK)
         RTE_LOG(ERR, IPVS, "%s: fail to unregister ICMP\n", __func__);
+
+    if (proto_unregister(&dp_vs_proto_icmp6) != EDPVS_OK)
+        RTE_LOG(ERR, IPVS, "%s: fail to unregister ICMPV6\n", __func__);
 
     if (proto_unregister(&dp_vs_proto_tcp) != EDPVS_OK)
         RTE_LOG(ERR, IPVS, "%s: fail to unregister TCP\n", __func__);

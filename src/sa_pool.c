@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -23,10 +23,10 @@
  * ways to achieve the goal. one is to calc RSS the same way of
  * NIC to select the currect CPU for connect.
  *
- * the way we use is based on Flow-Director (fdir), allocate
+ * the way we use is based on DPDK Generic Flow(rte_flow), allocate
  * local source (e.g., <ip, port>) for each CPU core in advance.
- * and redirect the back traffic to that CPU by fdir. it does not
- * need too many fdir rules, the number of rules can be equal to
+ * and redirect the back traffic to that CPU by rte_flow. it does not
+ * need too many flow rules, the number of rules can be equal to
  * the number of CPU core.
  *
  * LVS use laddr and try <laddr,lport> to see if is used when
@@ -55,15 +55,11 @@
 #include "parser/parser.h"
 #include "parser/vector.h"
 
-#define MAX_PORT            65536
-
 #define DEF_MIN_PORT        1025
 #define DEF_MAX_PORT        65535
 
 #define SAPOOL
 #define RTE_LOGTYPE_SAPOOL  RTE_LOGTYPE_USER1
-
-#define MAX_FDIR_PROTO      2
 
 #define SAPOOL_DEF_HASH_SZ  16
 #define SAPOOL_MIN_HASH_SZ  1
@@ -73,207 +69,70 @@ enum {
     SA_F_USED               = 0x01,
 };
 
-/**
- * if really need to to save memory, we can;
- * 1. use hlist_head
- * 2. use uint8_t flag
- * 3. remove sa_entry.addr, and get IP from sa_pool->ifa
- * 4. to __packed__ sa_entry.
- * 5. alloc sa_entries[] for 65536/cpu_num only.
- * 6. create sa_entry_pool only if pool_hash hit.
- *    since when dest (like RS) num may small.
- */
-
-/* socket address (sa) is <ip, port> pair. */
-struct sa_entry {
-    struct list_head        list;       /* node of sa_pool. */
-    uint32_t                flags;      /* SA_F_XXX */
-    union inet_addr         addr;
-    __be16                  port;
-};
-
-struct sa_entry_pool {
-    struct sa_entry         sa_entries[MAX_PORT];
-    struct list_head        used_enties;
-    struct list_head        free_enties;
-    /* another way is use total_used/free_cnt in sa_pool,
-     * so that we need not travels the hash to get stats.
-     * we use cnt here, since we may need per-pool stats. */
-    rte_atomic16_t          used_cnt;
-    rte_atomic16_t          free_cnt;
-    uint32_t                miss_cnt;
-};
-
-/* no lock needed because inet_ifaddr.sa_pool[]
- * is per-lcore. */
-struct sa_pool {
-    struct inet_ifaddr      *ifa;       /* back-pointer */
-
-    uint16_t                low;        /* min port */
-    uint16_t                high;       /* max port */
-    rte_atomic32_t          refcnt;
-
-    /* hashed pools by dest's <ip/port>. if no dest provided,
-     * just use first pool. it's not need create/destroy pool
-     * for each dest, that'll be too complicated. */
-    struct sa_entry_pool    *pool_hash;
-    uint8_t                 pool_hash_sz;
-
-    /* fdir filter ID */
-    uint32_t                filter_id[MAX_FDIR_PROTO];
-};
-
-struct sa_fdir {
+struct sa_flow {
     /* the ports one lcore can use means
-     * "(fdir.mask & port) == port_base" */
+     * "(sa_flow.mask & port) == port_base" */
     uint16_t                mask;       /* filter's port mask */
     lcoreid_t               lcore;
     __be16                  port_base;
-    uint16_t                soft_id;    /* current unsed soft-id,
-                                           increase after use. */
+    uint16_t                shift;
 };
 
-static struct sa_fdir       sa_fdirs[RTE_MAX_LCORE];
+static struct sa_flow       sa_flows[DPVS_MAX_LCORE];
 
 static uint8_t              sa_nlcore;
 static uint64_t             sa_lcore_mask;
 
-static uint8_t              sa_pool_hash_size   = SAPOOL_DEF_HASH_SZ;
-
-static int __add_del_filter(int af, struct netif_port *dev, lcoreid_t cid,
-                            const union inet_addr *dip, __be16 dport,
-                            uint32_t filter_id[MAX_FDIR_PROTO], bool add)
-{
-    struct rte_eth_fdir_filter filt[MAX_FDIR_PROTO] = {
-        {
-            .action.behavior = RTE_ETH_FDIR_ACCEPT,
-            .action.report_status = RTE_ETH_FDIR_REPORT_ID,
-            .soft_id = filter_id[0],
-        },
-        {
-            .action.behavior = RTE_ETH_FDIR_ACCEPT,
-            .action.report_status = RTE_ETH_FDIR_REPORT_ID,
-            .soft_id = filter_id[1],
-        },
-    };
-
-    if (af == AF_INET) {
-        filt[0].input.flow_type = RTE_ETH_FLOW_NONFRAG_IPV4_TCP;
-        filt[0].input.flow.ip4_flow.dst_ip = dip->in.s_addr;
-        filt[0].input.flow.tcp4_flow.dst_port = dport;
-        filt[1].input.flow_type = RTE_ETH_FLOW_NONFRAG_IPV4_UDP;
-        filt[1].input.flow.ip4_flow.dst_ip = dip->in.s_addr;
-        filt[1].input.flow.udp4_flow.dst_port = dport;
-    } else if (af == AF_INET6) {
-        filt[0].input.flow_type = RTE_ETH_FLOW_NONFRAG_IPV6_TCP;
-        memcpy(filt[0].input.flow.ipv6_flow.dst_ip, &dip->in6, sizeof(struct in6_addr));
-        filt[0].input.flow.tcp6_flow.dst_port = dport;
-        filt[1].input.flow_type = RTE_ETH_FLOW_NONFRAG_IPV6_UDP;
-        memcpy(filt[1].input.flow.ipv6_flow.dst_ip, &dip->in6, sizeof(struct in6_addr));
-        filt[1].input.flow.udp6_flow.dst_port = dport;
-    } else {
-        return EDPVS_NOTSUPP;
-    }
-
-    queueid_t queue;
-    int err;
-    enum rte_filter_op op, rop;
-#ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    char ipaddr[64];
-#endif
-
-    if (dev->netif_ops && dev->netif_ops->op_filter_supported) {
-        if (dev->netif_ops->op_filter_supported(dev, RTE_ETH_FILTER_FDIR) < 0) {
-            if (dev->nrxq <= 1)
-                return EDPVS_OK;
-            RTE_LOG(ERR, SAPOOL, "%s: FDIR is not supported by device %s. Only"
-                    " single rxq can be configured.\n", __func__, dev->name);
-            return EDPVS_NOTSUPP;
-        }
-    } else {
-        RTE_LOG(ERR, SAPOOL, "%s: FDIR support of device %s is not known.\n",
-                __func__, dev->name);
-        return EDPVS_INVAL;
-    }
-
-    err = netif_get_queue(dev, cid, &queue);
-    if (err != EDPVS_OK)
-        return err;
-
-    filt[0].action.rx_queue = filt[1].action.rx_queue = queue;
-    op = add ? RTE_ETH_FILTER_ADD : RTE_ETH_FILTER_DELETE;
-
-    err = netif_fdir_filter_set(dev, op, &filt[0]);
-    if (err != EDPVS_OK)
-        return err;
-
-    err = netif_fdir_filter_set(dev, op, &filt[1]);
-    if (err != EDPVS_OK) {
-        rop = add ? RTE_ETH_FILTER_DELETE : RTE_ETH_FILTER_ADD;
-        netif_fdir_filter_set(dev, rop, &filt[0]);
-        return err;
-    }
-
-#ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    RTE_LOG(DEBUG, SAPOOL, "FDIR: %s %s TCP/UDP "
-            "ip %s port %d (0x%04x) mask 0x%04X queue %d lcore %2d\n",
-            add ? "add" : "del", dev->name,
-            inet_ntop(af, &dip, ipaddr, sizeof(ipaddr)) ? : "::",
-            ntohs(dport), ntohs(dport), sa_fdirs[cid].mask, queue, cid);
-#endif
-
-    return err;
-}
-
-static inline int sa_add_filter(int af, struct netif_port *dev, lcoreid_t cid,
-                                const union inet_addr *dip, __be16 dport,
-                                uint32_t filter_id[MAX_FDIR_PROTO])
-{
-    return  __add_del_filter(af, dev, cid, dip, dport, filter_id, true);
-}
-
-static inline int sa_del_filter(int af, struct netif_port *dev, lcoreid_t cid,
-                                const union inet_addr *dip, __be16 dport,
-                                uint32_t filter_id[MAX_FDIR_PROTO])
-{
-    return  __add_del_filter(af, dev, cid, dip, dport, filter_id, false);
-}
+static uint8_t              sa_pool_hash_size  = SAPOOL_DEF_HASH_SZ;
+static bool                 sapool_flow_enable = true;
 
 static int sa_pool_alloc_hash(struct sa_pool *ap, uint8_t hash_sz,
-                               const struct sa_fdir *fdir)
+                               const struct sa_flow *flow)
 {
     int hash;
     struct sa_entry_pool *pool;
+    struct sa_entry * sep;
     uint32_t port; /* should be u32 or 65535==0 */
+    uint32_t sa_entry_pool_size;
+    uint32_t sa_entry_size;
+    uint32_t sa_entry_num;
 
-    ap->pool_hash = rte_malloc(NULL, sizeof(struct sa_entry_pool) * hash_sz,
+    sa_entry_num = MAX_PORT >> flow->shift;
+    sa_entry_pool_size = sizeof(struct sa_entry_pool) * hash_sz;
+    sa_entry_size = sizeof(struct sa_entry) * sa_entry_num * hash_sz;
+
+    ap->pool_hash = rte_malloc(NULL, sa_entry_pool_size + sa_entry_size,
                                RTE_CACHE_LINE_SIZE);
     if (!ap->pool_hash)
         return EDPVS_NOMEM;
 
     ap->pool_hash_sz = hash_sz;
+    sep = (struct sa_entry *)&ap->pool_hash[hash_sz];
 
+    /* the big loop may take tens of milliseconds */
     for (hash = 0; hash < hash_sz; hash++) {
         pool = &ap->pool_hash[hash];
 
         INIT_LIST_HEAD(&pool->used_enties);
         INIT_LIST_HEAD(&pool->free_enties);
 
-        rte_atomic16_set(&pool->used_cnt, 0);
-        rte_atomic16_set(&pool->free_cnt, 0);
+        pool->used_cnt = 0;
+        pool->free_cnt = 0;
+        pool->shift = flow->shift;
+        pool->sa_entries = &sep[sa_entry_num * hash];
 
         for (port = ap->low; port <= ap->high; port++) {
             struct sa_entry *sa;
 
-            if (fdir->mask &&
-                ((uint16_t)port & fdir->mask) != ntohs(fdir->port_base))
+            if (flow->mask &&
+                ((uint16_t)port & flow->mask) != ntohs(flow->port_base))
                 continue;
 
-            sa = &pool->sa_entries[(uint16_t)port];
+            sa = &pool->sa_entries[(uint16_t)(port >> pool->shift)];
             sa->addr = ap->ifa->addr;
             sa->port = htons((uint16_t)port);
             list_add_tail(&sa->list, &pool->free_enties);
-            rte_atomic16_inc(&pool->free_cnt);
+            pool->free_cnt++;
         }
     }
 
@@ -282,16 +141,70 @@ static int sa_pool_alloc_hash(struct sa_pool *ap, uint8_t hash_sz,
 
 static int sa_pool_free_hash(struct sa_pool *ap)
 {
-    rte_free(ap->pool_hash);
+    /* FIXME: it may take about 3ms to free the huge `sa->pool_hash`, and
+     * @rte_free uses a spinlock to protect its heap. If multiple workers
+     * free their sapools simultaneously, a worker may be stuck up to 3*N ms,
+     * where `N` is the dpvs worker number.
+     *
+     * use mempool for sapool could solve the problem. we still use @rte_free
+     * here considering sapool is not frequently changed.
+     */
+    rte_free(ap->pool_hash);    /* it may take up to 3ms */
     ap->pool_hash_sz = 0;
     return EDPVS_OK;
 }
 
+static int sa_pool_add_filter(struct inet_ifaddr *ifa, struct sa_pool *ap,
+                             lcoreid_t cid)
+{
+    int err;
+    struct sa_flow *flow = &sa_flows[cid];
+
+    netif_flow_handler_param_t flow_handlers = {
+            .size     = MAX_SA_FLOW,
+            .flow_num = 0,
+            .handlers = ap->flows,
+    };
+
+    if (!sapool_flow_enable)
+        return EDPVS_OK;
+
+    err = netif_sapool_flow_add(ifa->idev->dev, cid, ifa->af, &ifa->addr,
+            flow->port_base, htons(flow->mask), &flow_handlers);
+    ap->flow_num = flow_handlers.flow_num;
+
+    return err;
+}
+
+static int sa_pool_del_filter(struct inet_ifaddr *ifa, struct sa_pool *ap,
+                               lcoreid_t cid)
+{
+    struct sa_flow *flow = &sa_flows[cid];
+
+    netif_flow_handler_param_t flow_handlers = {
+            .size     = MAX_SA_FLOW,
+            .flow_num = ap->flow_num,
+            .handlers = ap->flows,
+    };
+
+    if (!sapool_flow_enable)
+        return EDPVS_OK;
+
+    return netif_sapool_flow_del(ifa->idev->dev, cid, ifa->af, &ifa->addr,
+            flow->port_base, htons(flow->mask), &flow_handlers);
+}
+
 int sa_pool_create(struct inet_ifaddr *ifa, uint16_t low, uint16_t high)
 {
-    struct sa_pool *ap;
     int err;
-    lcoreid_t cid;
+    struct sa_pool *ap;
+    lcoreid_t cid = rte_lcore_id();
+
+    if (cid > 64 || !((sa_lcore_mask & (1UL << cid)))) {
+        if (cid == rte_get_main_lcore())
+            return EDPVS_OK; /* no sapool on master */
+        return EDPVS_INVAL;
+    }
 
     low = low ? : DEF_MIN_PORT;
     high = high ? : DEF_MAX_PORT;
@@ -301,91 +214,95 @@ int sa_pool_create(struct inet_ifaddr *ifa, uint16_t low, uint16_t high)
         return EDPVS_INVAL;
     }
 
-    for (cid = 0; cid < RTE_MAX_LCORE; cid++) {
-        uint32_t filtids[MAX_FDIR_PROTO];
-        struct sa_fdir *fdir = &sa_fdirs[cid];
+    ap = rte_zmalloc(NULL, sizeof(struct sa_pool), 0);
+    if (unlikely(!ap))
+        return EDPVS_NOMEM;
 
-        /* skip master and unused cores */
-        if (cid > 64 || !(sa_lcore_mask & (1L << cid)))
-            continue;
-        assert(rte_lcore_is_enabled(cid) && cid != rte_get_master_lcore());
+    ap->ifa = ifa;
+    ap->low = low;
+    ap->high = high;
+    ap->flags = 0;
+    rte_atomic32_set(&ap->refcnt, 1);
 
-        ap = rte_zmalloc(NULL, sizeof(struct sa_pool), 0);
-        if (!ap) {
-            err = EDPVS_NOMEM;
-            goto errout;
-        }
-
-        ap->ifa = ifa;
-        ap->low = low;
-        ap->high = high;
-        rte_atomic32_set(&ap->refcnt, 0);
-
-        err = sa_pool_alloc_hash(ap, sa_pool_hash_size, fdir);
-        if (err != EDPVS_OK) {
-            rte_free(ap);
-            goto errout;
-        }
-
-        /* if add filter failed, waste some soft-id is acceptable. */
-        filtids[0] = fdir->soft_id++;
-        filtids[1] = fdir->soft_id++;
-        err = sa_add_filter(ifa->af, ifa->idev->dev, cid, &ifa->addr,
-                            fdir->port_base, filtids);
-        if (err != EDPVS_OK) {
-            sa_pool_free_hash(ap);
-            rte_free(ap);
-            goto errout;
-        }
-        ap->filter_id[0] = filtids[0];
-        ap->filter_id[1] = filtids[1];
-
-        ifa->sa_pools[cid] = ap;
+    err = sa_pool_alloc_hash(ap, sa_pool_hash_size, &sa_flows[cid]);
+    if (err != EDPVS_OK) {
+        goto free_ap;
     }
 
+    err = sa_pool_add_filter(ifa, ap, cid);
+    if (err != EDPVS_OK) {
+        goto free_hash;
+    }
+
+    ifa->sa_pool = ap;
+
+    /* inc ifa->refcnt to hold it */
+    rte_atomic32_inc(&ifa->refcnt);
+
 #ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    RTE_LOG(DEBUG, SAPOOL, "%s: sa pool created\n", __func__);
+    {
+        char addr[64];
+        RTE_LOG(INFO, SAPOOL, "[%02d] %s: sa pool created -- %s\n", rte_lcore_id(),
+                __func__, inet_ntop(ifa->af, &ifa->addr, addr, sizeof(addr)) ? : NULL);
+    }
 #endif
+
     return EDPVS_OK;
 
-errout:
-    sa_pool_destroy(ifa);
+free_hash:
+    sa_pool_free_hash(ap);
+free_ap:
+    rte_free(ap);
     return err;
 }
 
+/*
+ * the func name @sa_pool_destroy is a litle confusing, its more reasonable
+ * name may be something like `sa_pool_put`. we keep the name to correspond
+ * with @sa_pool_create.
+ * */
 int sa_pool_destroy(struct inet_ifaddr *ifa)
 {
-    lcoreid_t cid;
+    int err;
+    struct sa_pool *ap;
+    lcoreid_t cid = rte_lcore_id();
 
-    if (!ifa || !ifa->sa_pools)
+    if (cid > 64 || !((sa_lcore_mask & (1UL << cid)))) {
+        if (cid == rte_get_main_lcore())
+            return EDPVS_OK;
         return EDPVS_INVAL;
-
-    for (cid = 0; cid < RTE_MAX_LCORE; cid++) {
-        struct sa_pool *ap = ifa->sa_pools[cid];
-        struct sa_fdir *fdir = &sa_fdirs[cid];
-
-        if (cid > 64 || !(sa_lcore_mask & (1L << cid)))
-            continue;
-        assert(rte_lcore_is_enabled(cid) && cid != rte_get_master_lcore());
-
-        if (!ap)
-            continue;
-
-        if (rte_atomic32_read(&ap->refcnt) != 0) {
-            RTE_LOG(WARNING, SAPOOL, "%s: sa pool is inusing\n", __func__);
-            return EDPVS_BUSY;
-        }
-
-        sa_del_filter(ifa->af, ifa->idev->dev, cid, &ifa->addr,
-                      fdir->port_base, ap->filter_id);
-        sa_pool_free_hash(ap);
-        rte_free(ap);
-        ifa->sa_pools[cid] = NULL;
     }
 
+    if (!ifa || !ifa->sa_pool)
+        return EDPVS_INVAL;
+    ap = ifa->sa_pool;
+
+    if (!rte_atomic32_dec_and_test(&ap->refcnt))
+        return EDPVS_OK;
+
+    err = sa_pool_del_filter(ifa, ap, cid);
+    if (err != EDPVS_OK) {
+        RTE_LOG(ERR, SAPOOL, "[%02d] %s: sa_del_filter failed -- %s\n",
+                cid, __func__, dpvs_strerror(err));
+        return err;
+    }
+
+    sa_pool_free_hash(ap);
+    rte_free(ap);
+
+    ifa->sa_pool = NULL;
+
 #ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    RTE_LOG(DEBUG, SAPOOL, "%s: sa pool destroyed\n", __func__);
+    {
+        char addr[64];
+        RTE_LOG(INFO, SAPOOL, "[%02d] %s: sa pool destroyed -- %s\n", rte_lcore_id(),
+                __func__, inet_ntop(ifa->af, &ifa->addr, addr, sizeof(addr)) ? : NULL);
+    }
 #endif
+
+    /* release ifa held by @sa_pool_create */
+    inet_addr_ifa_put(ifa);
+
     return EDPVS_OK;
 }
 
@@ -429,16 +346,12 @@ static inline int sa_pool_fetch(struct sa_entry_pool *pool,
     struct sa_entry *ent;
     struct sockaddr_in *sin = (struct sockaddr_in *)ss;
     struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
-#ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    char addr[64];
-#endif
 
     ent = list_first_entry_or_null(&pool->free_enties, struct sa_entry, list);
     if (!ent) {
 #ifdef CONFIG_DPVS_SAPOOL_DEBUG
         RTE_LOG(DEBUG, SAPOOL, "%s: no entry (used/free %d/%d)\n", __func__,
-                rte_atomic16_read(&pool->used_cnt),
-                rte_atomic16_read(&pool->free_cnt));
+                pool->used_cnt, pool->free_cnt);
 #endif
         pool->miss_cnt++;
         return EDPVS_RESOURCE;
@@ -458,13 +371,16 @@ static inline int sa_pool_fetch(struct sa_entry_pool *pool,
 
     ent->flags |= SA_F_USED;
     list_move_tail(&ent->list, &pool->used_enties);
-    rte_atomic16_inc(&pool->used_cnt);
-    rte_atomic16_dec(&pool->free_cnt);
+    pool->used_cnt++;
+    pool->free_cnt--;
 
 #ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    RTE_LOG(DEBUG, SAPOOL, "%s: %s:%d fetched!\n", __func__,
-            inet_ntop(ss->ss_family, &ent->addr, addr, sizeof(addr)) ? : NULL,
-            ntohs(ent->port));
+    {
+        char addr[64];
+        RTE_LOG(DEBUG, SAPOOL, "%s: %s:%d fetched!\n", __func__,
+                inet_ntop(ss->ss_family, &ent->addr, addr, sizeof(addr)) ? : NULL,
+                ntohs(ent->port));
+    }
 #endif
 
     return EDPVS_OK;
@@ -479,9 +395,6 @@ static inline int sa_pool_release(struct sa_entry_pool *pool,
     const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
     const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
     __be16 port;
-#ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    char addr[64];
-#endif
 
     if (ss->ss_family == AF_INET)
         port = ntohs(sin->sin_port);
@@ -494,7 +407,7 @@ static inline int sa_pool_release(struct sa_entry_pool *pool,
     /* it's too slow to traverse the used_enties list
      * (by list_for_each_entry_safe) to find the @entry
      * matchs @sin. */
-    ent = &pool->sa_entries[port];
+    ent = &pool->sa_entries[port >> pool->shift];
     if (!(ent->flags & SA_F_USED)) {
         RTE_LOG(WARNING, SAPOOL, "%s: port %d not in use !\n", __func__, port);
         return EDPVS_INVAL;
@@ -509,13 +422,16 @@ static inline int sa_pool_release(struct sa_entry_pool *pool,
 
     ent->flags &= (~SA_F_USED);
     list_move_tail(&ent->list, &pool->free_enties);
-    rte_atomic16_dec(&pool->used_cnt);
-    rte_atomic16_inc(&pool->free_cnt);
+    pool->used_cnt--;
+    pool->free_cnt++;
 
 #ifdef CONFIG_DPVS_SAPOOL_DEBUG
-    RTE_LOG(DEBUG, SAPOOL, "%s: %s:%d released!\n", __func__,
-            inet_ntop(ss->ss_family, &ent->addr, addr, sizeof(addr)) ? : NULL,
-            ntohs(ent->port));
+    {
+        char addr[64];
+        RTE_LOG(DEBUG, SAPOOL, "%s: %s:%d released!\n", __func__,
+                inet_ntop(ss->ss_family, &ent->addr, addr, sizeof(addr)) ? : NULL,
+                ntohs(ent->port));
+    }
 #endif
 
     return EDPVS_OK;
@@ -560,24 +476,24 @@ static int sa4_fetch(struct netif_port *dev,
     if (saddr && saddr->sin_addr.s_addr != INADDR_ANY && saddr->sin_port != 0)
         return EDPVS_OK; /* everything is known, why call this function ? */
 
-    /* if source IP is assiged, we can find ifa->this_sa_pool
+    /* if source IP is assiged, we can find ifa->sa_pool
      * without @daddr and @dev. */
     if (saddr->sin_addr.s_addr) {
         ifa = inet_addr_ifa_get(AF_INET, dev, (union inet_addr*)&saddr->sin_addr);
         if (!ifa)
             return EDPVS_NOTEXIST;
 
-        if (!ifa->this_sa_pool) {
-            RTE_LOG(WARNING, SAPOOL, "%s: fetch addr on IP without pool.", __func__);
+        if (!ifa->sa_pool) {
+            RTE_LOG(WARNING, SAPOOL, "%s: fetch addr on IP without sapool.", __func__);
             inet_addr_ifa_put(ifa);
             return EDPVS_INVAL;
         }
 
-        err = sa_pool_fetch(sa_pool_hash(ifa->this_sa_pool,
+        err = sa_pool_fetch(sa_pool_hash(ifa->sa_pool,
                             (struct sockaddr_storage *)daddr),
                             (struct sockaddr_storage *)saddr);
         if (err == EDPVS_OK)
-            rte_atomic32_inc(&ifa->this_sa_pool->refcnt);
+            rte_atomic32_inc(&ifa->sa_pool->refcnt);
         inet_addr_ifa_put(ifa);
         return err;
     }
@@ -589,7 +505,7 @@ static int sa4_fetch(struct netif_port *dev,
     fl.fl4_saddr.s_addr = saddr ? saddr->sin_addr.s_addr : htonl(INADDR_ANY);
     rt = route4_output(&fl);
     if (!rt)
-        return EDPVS_NOROUTE;;
+        return EDPVS_NOROUTE;
 
     /* select source address. */
     if (!rt->src.s_addr) {
@@ -603,7 +519,7 @@ static int sa4_fetch(struct netif_port *dev,
     }
     route4_put(rt);
 
-    if (!ifa->this_sa_pool) {
+    if (!ifa->sa_pool) {
         RTE_LOG(WARNING, SAPOOL, "%s: fetch addr on IP without pool.",
                 __func__);
         inet_addr_ifa_put(ifa);
@@ -611,11 +527,11 @@ static int sa4_fetch(struct netif_port *dev,
     }
 
     /* do fetch socket address */
-    err = sa_pool_fetch(sa_pool_hash(ifa->this_sa_pool,
+    err = sa_pool_fetch(sa_pool_hash(ifa->sa_pool,
                         (struct sockaddr_storage *)daddr),
                         (struct sockaddr_storage *)saddr);
     if (err == EDPVS_OK)
-        rte_atomic32_inc(&ifa->this_sa_pool->refcnt);
+        rte_atomic32_inc(&ifa->sa_pool->refcnt);
 
     inet_addr_ifa_put(ifa);
     return err;
@@ -634,24 +550,24 @@ static int sa6_fetch(struct netif_port *dev,
     if (saddr && !ipv6_addr_any(&saddr->sin6_addr) && saddr->sin6_port != 0)
         return EDPVS_OK; /* everything is known, why call this function ? */
 
-    /* if source IP is assiged, we can find ifa->this_sa_pool
+    /* if source IP is assiged, we can find ifa->sa_pool
      * without @daddr and @dev. */
     if (!ipv6_addr_any(&saddr->sin6_addr)) {
         ifa = inet_addr_ifa_get(AF_INET6, dev, (union inet_addr*)&saddr->sin6_addr);
         if (!ifa)
             return EDPVS_NOTEXIST;
 
-        if (!ifa->this_sa_pool) {
+        if (!ifa->sa_pool) {
             RTE_LOG(WARNING, SAPOOL, "%s: fetch addr on IP without pool.", __func__);
             inet_addr_ifa_put(ifa);
             return EDPVS_INVAL;
         }
 
-        err = sa_pool_fetch(sa_pool_hash(ifa->this_sa_pool,
+        err = sa_pool_fetch(sa_pool_hash(ifa->sa_pool,
                             (struct sockaddr_storage *)daddr),
                             (struct sockaddr_storage *)saddr);
         if (err == EDPVS_OK)
-            rte_atomic32_inc(&ifa->this_sa_pool->refcnt);
+            rte_atomic32_inc(&ifa->sa_pool->refcnt);
         inet_addr_ifa_put(ifa);
         return err;
     }
@@ -665,7 +581,7 @@ static int sa6_fetch(struct netif_port *dev,
         fl6.fl6_saddr= saddr->sin6_addr;
     rt6 = route6_output(NULL, &fl6);
     if (!rt6)
-        return EDPVS_NOROUTE;;
+        return EDPVS_NOROUTE;
 
     /* select source address. */
     if (ipv6_addr_any(&rt6->rt6_src.addr)) {
@@ -682,7 +598,7 @@ static int sa6_fetch(struct netif_port *dev,
     }
     route6_put(rt6);
 
-    if (!ifa->this_sa_pool) {
+    if (!ifa->sa_pool) {
         RTE_LOG(WARNING, SAPOOL, "%s: fetch addr on IP without pool.",
                 __func__);
         inet_addr_ifa_put(ifa);
@@ -690,11 +606,11 @@ static int sa6_fetch(struct netif_port *dev,
     }
 
     /* do fetch socket address */
-    err = sa_pool_fetch(sa_pool_hash(ifa->this_sa_pool,
+    err = sa_pool_fetch(sa_pool_hash(ifa->sa_pool,
                         (struct sockaddr_storage *)daddr),
                         (struct sockaddr_storage *)saddr);
     if (err == EDPVS_OK)
-        rte_atomic32_inc(&ifa->this_sa_pool->refcnt);
+        rte_atomic32_inc(&ifa->sa_pool->refcnt);
 
     inet_addr_ifa_put(ifa);
     return err;
@@ -718,7 +634,7 @@ int sa_fetch(int af, struct netif_port *dev,
         return EDPVS_NOTSUPP;
 }
 
-/* call me with `saddr` must not NULL */
+/* call me with @saddr must not NULL */
 int sa_release(const struct netif_port *dev,
                const struct sockaddr_storage *daddr,
                const struct sockaddr_storage *saddr)
@@ -736,10 +652,16 @@ int sa_release(const struct netif_port *dev,
         const struct sockaddr_in *saddr4 = (const struct sockaddr_in *)saddr;
         ifa = inet_addr_ifa_get(AF_INET, dev,
                 (union inet_addr*)&saddr4->sin_addr);
+        if (unlikely(!ifa))
+            ifa = inet_addr_ifa_get_expired(AF_INET, dev,
+                    (union inet_addr*)&saddr4->sin_addr);
     } else if (AF_INET6 == saddr->ss_family) {
         const struct sockaddr_in6 *saddr6 = (const struct sockaddr_in6 *)saddr;
         ifa = inet_addr_ifa_get(AF_INET6, dev,
                 (union inet_addr*)&saddr6->sin6_addr);
+        if (unlikely(!ifa))
+            ifa = inet_addr_ifa_get_expired(AF_INET6, dev,
+                    (union inet_addr*)&saddr6->sin6_addr);
     } else {
         return EDPVS_NOTSUPP;
     }
@@ -747,103 +669,50 @@ int sa_release(const struct netif_port *dev,
     if (!ifa)
         return EDPVS_NOTEXIST;
 
-    if (!ifa->this_sa_pool) {
+    if (!ifa->sa_pool) {
         RTE_LOG(WARNING, SAPOOL, "%s: release addr on IP without pool.",
                 __func__);
         inet_addr_ifa_put(ifa);
         return EDPVS_INVAL;
     }
 
-    err = sa_pool_release(sa_pool_hash(ifa->this_sa_pool, daddr), saddr);
-    if (err == EDPVS_OK)
-        rte_atomic32_dec(&ifa->this_sa_pool->refcnt);
-    inet_addr_ifa_put(ifa);
-    return err;
-}
-
-int sa_pool_stats(const struct inet_ifaddr *ifa, struct sa_pool_stats *stats)
-{
-    struct dpvs_msg *req, *reply;
-    struct dpvs_multicast_queue *replies = NULL;
-    int err;
-
-    memset(stats, 0, sizeof(*stats));
-
-    /*
-     * worker need know which ifa's stats to get.
-     * but passing @ifa pointer to worker lcores doesn't make sense,
-     * note the worker must only access per-lcore data ifa->sa_pools[cid].
-     */
-    req = msg_make(MSG_TYPE_SAPOOL_STATS, 0, DPVS_MSG_MULTICAST,
-                   rte_lcore_id(), sizeof(struct inet_ifaddr *), &ifa);
-    if (!req)
-        return EDPVS_NOMEM;
-
-    err = multicast_msg_send(req, 0, &replies);
+    err = sa_pool_release(sa_pool_hash(ifa->sa_pool, daddr), saddr);
     if (err != EDPVS_OK) {
-        RTE_LOG(ERR, SAPOOL, "%s: mc msg send fail: %s\n", __func__,
-                dpvs_strerror(err));
-        msg_destroy(&req);
+        inet_addr_ifa_put(ifa);
         return err;
     }
 
-    list_for_each_entry(reply, &replies->mq, mq_node) {
-        struct sa_pool_stats *st = (struct sa_pool_stats *)reply->data;
-        assert(st);
+    sa_pool_destroy(ifa);
 
-        stats->used_cnt += st->used_cnt;
-        stats->free_cnt += st->free_cnt;
-        stats->miss_cnt += st->miss_cnt;
-    }
-
-    msg_destroy(&req);
-    return 0;
-}
-
-static int sa_msg_get_stats(struct dpvs_msg *msg)
-{
-    const struct inet_ifaddr *ifa;
-    struct sa_pool_stats *stats;
-    struct sa_entry_pool *pool;
-    void *ptr;
-    int hash;
-
-    assert(msg && msg->len == sizeof(struct inet_ifaddr *));
-
-    ptr = msg->data;
-    ifa = *(struct inet_ifaddr **)ptr;
-
-    stats = rte_zmalloc(NULL, sizeof(*stats), 0);
-    if (!stats)
-        return EDPVS_NOMEM;
-
-    if (!ifa->this_sa_pool)
-        goto reply;
-
-    for (hash = 0; hash < ifa->this_sa_pool->pool_hash_sz; hash++) {
-        pool = &ifa->this_sa_pool->pool_hash[hash];
-        assert(pool);
-
-        stats->used_cnt += rte_atomic16_read(&pool->used_cnt);
-        stats->free_cnt += rte_atomic16_read(&pool->free_cnt);
-        stats->miss_cnt += pool->miss_cnt;
-    }
-
-reply:
-    msg->reply.len = sizeof(*stats);
-    msg->reply.data = stats;
+    inet_addr_ifa_put(ifa);
 
     return EDPVS_OK;
 }
 
-static struct dpvs_msg_type sa_stats_msg = {
-    .type           = MSG_TYPE_SAPOOL_STATS,
-    .unicast_msg_cb = sa_msg_get_stats,
-};
+int get_sa_pool_stats(const struct inet_ifaddr *ifa, struct sa_pool_stats *stats)
+{
+    int hash;
+    struct sa_entry_pool *pool;
+
+    if (!ifa || !ifa->sa_pool || !stats)
+        return EDPVS_INVAL;
+
+    memset(stats, 0, sizeof(*stats));
+    for (hash = 0; hash < ifa->sa_pool->pool_hash_sz; hash++) {
+        pool = &ifa->sa_pool->pool_hash[hash];
+        assert(pool);
+
+        stats->used_cnt += pool->used_cnt;
+        stats->free_cnt += pool->free_cnt;
+        stats->miss_cnt += pool->miss_cnt;
+    }
+
+    return EDPVS_OK;
+}
 
 int sa_pool_init(void)
 {
-    int shift, err;
+    int shift;
     lcoreid_t cid;
     uint16_t port_base;
 
@@ -857,37 +726,31 @@ int sa_pool_init(void)
         return EDPVS_INVAL; /* bad config */
 
     port_base = 0;
-    for (cid = 0; cid < RTE_MAX_LCORE; cid++) {
-        if (cid > 64 || !(sa_lcore_mask & (1L << cid)))
+    for (cid = 0; cid < DPVS_MAX_LCORE; cid++) {
+        if (cid >= 64 || !(sa_lcore_mask & (1L << cid)))
             continue;
-        assert(rte_lcore_is_enabled(cid) && cid != rte_get_master_lcore());
+        assert(rte_lcore_is_enabled(cid) && cid != rte_get_main_lcore());
 
-        sa_fdirs[cid].mask = ~((~0x0) << shift);
-        sa_fdirs[cid].lcore = cid;
-        sa_fdirs[cid].port_base = htons(port_base);
-        sa_fdirs[cid].soft_id = 0;
+        sa_flows[cid].mask = ~((~0x0) << shift);
+        sa_flows[cid].lcore = cid;
+        sa_flows[cid].port_base = htons(port_base);
+        sa_flows[cid].shift = shift;
 
         port_base++;
     }
 
-    err = msg_type_mc_register(&sa_stats_msg);
-
-    return err;
+    return EDPVS_OK;
 }
 
 int sa_pool_term(void)
 {
-    int err;
-
-    err = msg_type_mc_unregister(&sa_stats_msg);
-
-    return err;
+    return EDPVS_OK;
 }
 
 /*
  * config file
  */
-static void sa_pool_hash_size_conf(vector_t tokens)
+static void sa_pool_hash_size_handler(vector_t tokens)
 {
     char *str = set_value(tokens);
     int size;
@@ -905,8 +768,26 @@ static void sa_pool_hash_size_conf(vector_t tokens)
     FREE_PTR(str);
 }
 
+static void sa_pool_flow_enable_handler(vector_t tokens)
+{
+    char *str = set_value(tokens);
+
+    if (!str)
+        return;
+
+    if (!strcasecmp(str, "on"))
+        sapool_flow_enable = true;
+    if (!strcasecmp(str, "off"))
+        sapool_flow_enable = false;
+    else
+        RTE_LOG(WARNING, SAPOOL, "sapool_filter_enable = %s\n", sapool_flow_enable ? "on" : "off");
+
+    FREE_PTR(str);
+}
+
 void install_sa_pool_keywords(void)
 {
     install_keyword_root("sa_pool", NULL);
-    install_keyword("pool_hash_size", sa_pool_hash_size_conf, KW_TYPE_INIT);
+    install_keyword("pool_hash_size", sa_pool_hash_size_handler, KW_TYPE_INIT);
+    install_keyword("flow_enable", sa_pool_flow_enable_handler, KW_TYPE_INIT);
 }

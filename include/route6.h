@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2018 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -14,9 +14,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- */
-/**
- * IPv6 route.
  */
 #ifndef __DPVS_ROUTE6_H__
 #define __DPVS_ROUTE6_H__
@@ -44,8 +41,9 @@ struct route6 {
     rte_atomic32_t      refcnt;
 };
 
-struct route6 *route6_input(struct rte_mbuf *mbuf, struct flow6 *fl6);
-struct route6 *route6_output(struct rte_mbuf *mbuf, struct flow6 *fl6);
+struct route6 *route6_input(const struct rte_mbuf *mbuf, struct flow6 *fl6);
+struct route6 *route6_output(const struct rte_mbuf *mbuf, struct flow6 *fl6);
+int route6_get(struct route6 *rt);
 int route6_put(struct route6 *rt);
 
 int route6_init(void);
@@ -84,8 +82,8 @@ struct route6_method {
     int (*rt6_add_lcore)(const struct dp_vs_route6_conf *);
     int (*rt6_del_lcore)(const struct dp_vs_route6_conf *);
     struct route6* (*rt6_get)(const struct dp_vs_route6_conf *);
-    struct route6* (*rt6_input)(struct rte_mbuf *, struct flow6 *);
-    struct route6* (*rt6_output)(struct rte_mbuf *, struct flow6 *);
+    struct route6* (*rt6_input)(const struct rte_mbuf *, struct flow6 *);
+    struct route6* (*rt6_output)(const struct rte_mbuf *, struct flow6 *);
     struct dp_vs_route6_conf_array* (*rt6_dump)(
             const struct dp_vs_route6_conf *rt6_cfg,
             size_t *nbytes);
@@ -104,8 +102,10 @@ static inline void rt6_fill_with_cfg(struct route6 *rt6,
     rt6->rt6_prefsrc = cf->prefsrc;
     rt6->rt6_dev = netif_port_get_by_name(cf->ifname);
     rt6->rt6_gateway = cf->gateway;
-    rt6->rt6_mtu = cf->mtu;
     rt6->rt6_flags = cf->flags;
+    rt6->rt6_mtu = cf->mtu;
+    if (!cf->mtu && rt6->rt6_dev)
+        rt6->rt6_mtu = rt6->rt6_dev->mtu;
 }
 
 static inline void rt6_fill_cfg(struct dp_vs_route6_conf *cf,

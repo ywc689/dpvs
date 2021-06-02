@@ -21,7 +21,7 @@
  *        Wensong Zhang       :   added the long options
  *        Wensong Zhang       :   added the hostname and portname input
  *        Wensong Zhang       :   added the hostname and portname output
- *	  Lars Marowsky-Brée  :   added persistence granularity support
+ *        Lars Marowsky-Brée  :   added persistence granularity support
  *        Julian Anastasov    :   fixed the (null) print for unknown services
  *        Wensong Zhang       :   added the port_to_anyname function
  *        Horms               :   added option to read commands from stdin
@@ -115,7 +115,7 @@
 #define IPVS_OPTION_PROCESSING	"popt"
 
 #include "config_stream.h"
-#include "../keepalived/keepalived/libipvs-2.6/libipvs.h"
+#include "../keepalived/keepalived/include/libipvs.h"
 
 #define IPVSADM_VERSION_NO	"v" VERSION
 #define IPVSADM_VERSION_DATE	"2008/5/15"
@@ -144,7 +144,10 @@
 #define CMD_ADDBLKLST		(CMD_NONE+18)
 #define CMD_DELBLKLST		(CMD_NONE+19)
 #define CMD_GETBLKLST		(CMD_NONE+20)
-#define CMD_MAX			CMD_GETBLKLST
+#define CMD_ADDWHTLST		(CMD_NONE+21)
+#define CMD_DELWHTLST		(CMD_NONE+22)
+#define CMD_GETWHTLST		(CMD_NONE+23)
+#define CMD_MAX			CMD_GETWHTLST
 #define NUMBER_OF_CMD		(CMD_MAX - CMD_NONE)
 
 static const char* cmdnames[] = {
@@ -162,12 +165,15 @@ static const char* cmdnames[] = {
 	"restore",
 	"save",
 	"zero",
-	"add-laddr" , 
-	"del-laddr" , 
+	"add-laddr" ,
+	"del-laddr" ,
 	"get-laddr" ,
 	"add-blklst",
 	"del-blklst",
 	"get-blklst",
+	"add-whtlst",
+	"del-whtlst",
+	"get-whtlst",
 };
 
 static const char* optnames[] = {
@@ -193,13 +199,16 @@ static const char* optnames[] = {
 	"syncid",
 	"exact",
 	"ops",
-	"pe" , 
+	"pe" ,
 	"local-address" ,
-	"blklst-address", 
-	"synproxy" , 
-	"ifname" , 
+	"blklst-address",
+	"synproxy" ,
+	"ifname" ,
 	"sockpair" ,
 	"hash-target",
+	"cpu",
+	"expire-quiescent",
+	"whtlst-address",
 };
 
 /*
@@ -212,27 +221,53 @@ static const char* optnames[] = {
  */
 static const char commands_v_options[NUMBER_OF_CMD][NUMBER_OF_OPT] =
 {
-        /* -n   -c   svc  -s   -p   -M   -r   fwd  -w   -x   -y   -mc  tot  dmn  -st  -rt  thr  -pc  srt  sid  -ex  ops  pe   laddr blst syn ifname sockpair hashtag*/
-/*ADD*/      {'x', 'x', '+', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x',  ' ', 'x' ,'x' ,' '},
-/*EDIT*/     {'x', 'x', '+', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x',  ' ', 'x' ,'x' ,' '},
-/*DEL*/      {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*FLUSH*/    {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*LIST*/     {' ', '1', '1', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '1', '1', ' ', ' ', ' ', ' ', ' ', ' ', ' ', 'x', 'x', 'x', 'x',  'x', 'x' ,' ' ,'x'},
-/*ADDSRV*/   {'x', 'x', '+', 'x', 'x', 'x', '+', ' ', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*DELSRV*/   {'x', 'x', '+', 'x', 'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*EDITSRV*/  {'x', 'x', '+', 'x', 'x', 'x', '+', ' ', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*TIMEOUT*/  {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*STARTD*/   {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*STOPD*/    {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*RESTORE*/  {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*SAVE*/     {' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*ZERO*/     {'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*ADDLADDR*/ {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+', 'x',  'x', '+' ,'x' ,'x'},
-/*DELLADDR*/ {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+', 'x',  'x', '+' ,'x' ,'x'},
-/*GETLADDR*/ {'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
-/*ADDBLKLST*/{'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+',  'x', 'x' ,'x' ,'x'},
-/*DELBLKLST*/{'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+',  'x', 'x' ,'x' ,'x'},
-/*GETBLKLST*/{'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x',  'x', 'x' ,'x' ,'x'},
+/*   -n   -c   svc  -s   -p   -M   -r   fwd  -w   -x   -y   -mc  tot  dmn  -st  -rt  thr  -pc  srt  sid  -ex  ops  pe laddr blst syn ifname sockpair hashtag cpu expire-quiescent wlst*/
+/*ADD*/
+    {'x', 'x', '+', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', ' ', 'x' ,'x' ,' ', 'x', ' ', 'x'},
+/*EDIT*/
+    {'x', 'x', '+', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', ' ', 'x' ,'x' ,' ', 'x', ' ', 'x'},
+/*DEL*/
+    {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*FLUSH*/
+    {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*LIST*/
+    {' ', '1', '1', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '1', '1', ' ', ' ', ' ', ' ', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x' ,' ' ,'x', ' ', 'x', 'x'},
+/*ADDSRV*/
+    {'x', 'x', '+', 'x', 'x', 'x', '+', ' ', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*DELSRV*/
+    {'x', 'x', '+', 'x', 'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*EDITSRV*/
+    {'x', 'x', '+', 'x', 'x', 'x', '+', ' ', ' ', ' ', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*TIMEOUT*/
+    {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*STARTD*/
+    {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*STOPD*/
+    {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*RESTORE*/
+    {'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*SAVE*/
+    {' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*ZERO*/
+    {'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*ADDLADDR*/
+    {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+', 'x', 'x', '+' ,'x' ,'x', 'x', 'x', 'x'},
+/*DELLADDR*/
+    {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+', 'x', 'x', '+' ,'x' ,'x', 'x', 'x', 'x'},
+/*GETLADDR*/
+    {'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', ' ', 'x', 'x'},
+/*ADDBLKLST*/
+    {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*DELBLKLST*/
+    {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', '+', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*GETBLKLST*/
+    {'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
+/*ADDWHTLST*/
+    {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', '+'},
+/*DELWHTLST*/
+    {'x', 'x', '+', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', '+'},
+/*GETWHTLST*/
+    {'x', 'x', ' ', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' ,'x' ,'x', 'x', 'x', 'x'},
 };
 
 /* printing format flags */
@@ -264,7 +299,9 @@ struct ipvs_command_entry {
 	ipvs_daemon_t		daemon;
 	ipvs_laddr_t		laddr;
 	ipvs_blklst_t		blklst;
+	ipvs_whtlst_t		whtlst;
 	ipvs_sockpair_t		sockpair;
+	lcoreid_t		cid;
 };
 
 /* Use values outside ASCII range so that if an option has
@@ -285,6 +322,8 @@ enum {
 	TAG_NO_SORT,
 	TAG_PERSISTENCE_ENGINE,
 	TAG_SOCKPAIR,
+	TAG_CPU,
+	TAG_CONN_EXPIRE_QUIESCENT,
 };
 
 /* various parsing helpers & parsing functions */
@@ -306,7 +345,7 @@ static int parse_sockpair(char *buf, ipvs_sockpair_t *sockpair);
 static int parse_match_snat(const char *buf, ipvs_service_t *svc);
 
 /* check the options based on the commands_v_options table */
-static void generic_opt_check(int command, int options);
+static void generic_opt_check(int command, unsigned int options);
 static void set_command(int *cmd, const int newcmd);
 static void set_option(unsigned int *options, unsigned int option);
 
@@ -320,20 +359,19 @@ static void fail(int err, char *msg, ...);
 static void list_conn(int is_template, unsigned int format);
 static void list_conn_sockpair(int is_template,
 		ipvs_sockpair_t *sockpair, unsigned int format);
-static void list_service(ipvs_service_t *svc, unsigned int format);
-static void list_all(unsigned int format);
+static void list_service(ipvs_service_t *svc, unsigned int format, lcoreid_t cid);
+static void list_all(unsigned int format, lcoreid_t cid);
 static void list_timeout(void);
 static void list_daemon(void);
-static int list_laddrs(ipvs_service_t *svc, int with_title);
-static int list_all_laddrs(void);
+static int list_laddrs(ipvs_service_t *svc, int with_title, lcoreid_t cid);
+static int list_all_laddrs(lcoreid_t cid);
 static void list_blklsts_print_title(void);
-static int list_blklst(uint32_t addr_v4, uint16_t port, uint16_t protocol);
+static int list_blklst(int af, const union nf_inet_addr *addr, uint16_t port, uint16_t protocol);
 static int list_all_blklsts(void);
+static void list_whtlsts_print_title(void);
+static int list_whtlst(int af, const union nf_inet_addr *addr, uint16_t port, uint16_t protocol);
+static int list_all_whtlsts(void);
 
-#if 0
-static int modprobe_ipvs(void);
-static void check_ipvs_version(void);
-#endif
 static int process_options(int argc, char **argv, int reading_stdin);
 
 
@@ -341,7 +379,7 @@ int main(int argc, char **argv)
 {
 	int result;
 
-	if (ipvs_init()) {
+	if (ipvs_init(0)) {
 		fail(2, "Can't initialize ipvs: %s\n"
 			"Are you sure that dpvs is running?",
 			ipvs_strerror(errno));
@@ -352,7 +390,7 @@ int main(int argc, char **argv)
 
 	/* list the table if there is no other arguement */
 	if (argc == 1){
-		list_all(FMT_NONE);
+		list_all(FMT_NONE, 0);
 		ipvs_close();
 		return 0;
 	}
@@ -398,11 +436,16 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 		{ "add-blklst", 'U', POPT_ARG_NONE, NULL, 'U', NULL, NULL },
 		{ "del-blklst", 'V', POPT_ARG_NONE, NULL, 'V', NULL, NULL },
 		{ "get-blklst", 'B', POPT_ARG_NONE, NULL, 'B', NULL, NULL },
+		{ "add-whtlst", 'O', POPT_ARG_NONE, NULL, 'O', NULL, NULL },
+		{ "del-whtlst", 'Y', POPT_ARG_NONE, NULL, 'Y', NULL, NULL },
+		{ "get-whtlst", 'W', POPT_ARG_NONE, NULL, 'W', NULL, NULL },
 		{ "tcp-service", 't', POPT_ARG_STRING, &optarg, 't',
 		  NULL, NULL },
 		{ "udp-service", 'u', POPT_ARG_STRING, &optarg, 'u',
 		  NULL, NULL },
 		{ "icmp-service", 'q', POPT_ARG_STRING, &optarg, 'q',
+		  NULL, NULL },
+		{ "icmpv6-service", '1', POPT_ARG_STRING, &optarg, '1',
 		  NULL, NULL },
 		{ "fwmark-service", 'f', POPT_ARG_STRING, &optarg, 'f',
 		  NULL, NULL },
@@ -448,10 +491,13 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 		  NULL, NULL },
 		{ "laddr", 'z', POPT_ARG_STRING, &optarg, 'z', NULL, NULL },
 		{ "blklst", 'k', POPT_ARG_STRING, &optarg, 'k', NULL, NULL },
+		{ "whtlst", '2', POPT_ARG_STRING, &optarg, '2', NULL, NULL },
 		{ "synproxy", 'j' , POPT_ARG_STRING, &optarg, 'j', NULL, NULL },
 		{ "ifname", 'F', POPT_ARG_STRING, &optarg, 'F', NULL, NULL },
 		{ "match", 'H', POPT_ARG_STRING, &optarg, 'H', NULL, NULL },
 		{ "hash-target", 'Y', POPT_ARG_STRING, &optarg, 'Y', NULL, NULL },
+		{ "cpu", '\0', POPT_ARG_STRING, &optarg, TAG_CPU, NULL, NULL },
+		{ "expire-quiescent", '\0', POPT_ARG_NONE, NULL, TAG_CONN_EXPIRE_QUIESCENT, NULL, NULL },
 		{ NULL, 0, 0, NULL, 0, NULL, NULL }
 	};
 
@@ -539,6 +585,15 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 	case 'B':
 		set_command(&ce->cmd, CMD_GETBLKLST);
 		break;
+	case 'O':
+		set_command(&ce->cmd, CMD_ADDWHTLST);
+		break;
+	case 'Y':
+		set_command(&ce->cmd, CMD_DELWHTLST);
+		break;
+	case 'W':
+		set_command(&ce->cmd, CMD_GETWHTLST);
+		break;
 	default:
 		tryhelp_exit(argv[0], -1);
 	}
@@ -549,23 +604,26 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 		case 'u':
 		case 'q':
 			set_option(options, OPT_SERVICE);
-            if (c == 't')
-                ce->svc.protocol = IPPROTO_TCP;
-            else if (c == 'u')
-                ce->svc.protocol = IPPROTO_UDP;
-            else
-                ce->svc.protocol = IPPROTO_ICMP;
+			if (c == 't')
+				ce->svc.user.protocol = IPPROTO_TCP;
+			else if (c == 'u')
+				ce->svc.user.protocol = IPPROTO_UDP;
+			else if (c == 'q')
+				ce->svc.user.protocol = IPPROTO_ICMP;
+			else if (c == '1') // a~Z is out. ipvsadm is really not friendly here
+				ce->svc.user.protocol = IPPROTO_ICMPV6;
 
 			parse = parse_service(optarg, &ce->svc);
 			if (!(parse & SERVICE_ADDR))
 				fail(2, "illegal virtual server "
 				     "address[:port] specified");
 			break;
-        case 'H':
+		case 'H':
 			set_option(options, OPT_SERVICE);
-            if (parse_match_snat(optarg, &ce->svc) != 0)
+			ce->svc.user.flags |= IP_VS_SVC_F_MATCH;
+			if (parse_match_snat(optarg, &ce->svc) != 0)
 				fail(2, "illegal match specified");
-            break;
+			break;
 		case 'f':
 			set_option(options, OPT_SERVICE);
 			/*
@@ -573,32 +631,32 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 			 * though it is not used
 			 */
 			ce->svc.af = AF_INET;/*FIXME:DPVS not support fwmark?*/
-			ce->svc.protocol = IPPROTO_TCP;
-			ce->svc.fwmark = parse_fwmark(optarg);
+			ce->svc.user.protocol = IPPROTO_TCP;
+			ce->svc.user.fwmark = parse_fwmark(optarg);
 			break;
 		case 's':
 			set_option(options, OPT_SCHEDULER);
-			strncpy(ce->svc.sched_name,
+			strncpy(ce->svc.user.sched_name,
 				optarg, IP_VS_SCHEDNAME_MAXLEN);
-			if (!memcmp(ce->svc.sched_name, "conhash", strlen("conhash")))
-				ce->svc.flags = ce->svc.flags | IP_VS_SVC_F_SIP_HASH; 
+			if (!memcmp(ce->svc.user.sched_name, "conhash", strlen("conhash")))
+				ce->svc.user.flags = ce->svc.user.flags | IP_VS_SVC_F_SIP_HASH;
 			break;
 		case 'p':
 			set_option(options, OPT_PERSISTENT);
-			ce->svc.flags |= IP_VS_SVC_F_PERSISTENT;
-			ce->svc.timeout =
+			ce->svc.user.flags |= IP_VS_SVC_F_PERSISTENT;
+			ce->svc.user.timeout =
 				parse_timeout(optarg, 1, MAX_TIMEOUT);
 			break;
 		case 'M':
 			set_option(options, OPT_NETMASK);
 			if (ce->svc.af != AF_INET6) {
-				parse = parse_netmask(optarg, &ce->svc.netmask);
+				parse = parse_netmask(optarg, &ce->svc.user.netmask);
 				if (parse != 1)
 					fail(2, "illegal virtual server "
 					     "persistent mask specified");
 			} else {
-				ce->svc.netmask = atoi(optarg);
-				if ((ce->svc.netmask < 1) || (ce->svc.netmask > 128))
+				ce->svc.user.netmask = atoi(optarg);
+				if ((ce->svc.user.netmask < 1) || (ce->svc.user.netmask > 128))
 					fail(2, "illegal ipv6 netmask specified");
 			}
 			break;
@@ -607,50 +665,50 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 			ipvs_service_t t_dest = ce->svc;
 			parse = parse_service(optarg, &t_dest);
 			ce->dest.af = t_dest.af;
-			ce->dest.addr = t_dest.addr;
-			ce->dest.port = t_dest.port;
+			ce->dest.nf_addr = t_dest.nf_addr;
+			ce->dest.user.port = t_dest.user.port;
 			if (!(parse & SERVICE_ADDR))
 				fail(2, "illegal real server "
 				     "address[:port] specified");
 			/* copy vport to dport if not specified */
 			if (parse == 1)
-				ce->dest.port = ce->svc.port;
+				ce->dest.user.port = ce->svc.user.port;
 			break;
 		case 'i':
 			set_option(options, OPT_FORWARD);
-			ce->dest.conn_flags = IP_VS_CONN_F_TUNNEL;
+			ce->dest.user.conn_flags = IP_VS_CONN_F_TUNNEL;
 			break;
 		case 'g':
 			set_option(options, OPT_FORWARD);
-			ce->dest.conn_flags = IP_VS_CONN_F_DROUTE;
+			ce->dest.user.conn_flags = IP_VS_CONN_F_DROUTE;
 			break;
 		case 'b':
 			set_option(options, OPT_FORWARD);
-			ce->dest.conn_flags = IP_VS_CONN_F_FULLNAT;
+			ce->dest.user.conn_flags = IP_VS_CONN_F_FULLNAT;
 			break;
 		case 'J':
 			set_option(options, OPT_FORWARD);
-			ce->dest.conn_flags = IP_VS_CONN_F_SNAT;
+			ce->dest.user.conn_flags = IP_VS_CONN_F_SNAT;
 			break;
 		case 'm':
 			set_option(options, OPT_FORWARD);
-			ce->dest.conn_flags = IP_VS_CONN_F_MASQ;
+			ce->dest.user.conn_flags = IP_VS_CONN_F_MASQ;
 			break;
 		case 'w':
 			set_option(options, OPT_WEIGHT);
-			if ((ce->dest.weight =
+			if ((ce->dest.user.weight =
 			     string_to_number(optarg, 0, 65535)) == -1)
 				fail(2, "illegal weight specified");
 			break;
 		case 'x':
 			set_option(options, OPT_UTHRESHOLD);
-			if ((ce->dest.u_threshold =
+			if ((ce->dest.user.u_threshold =
 			     string_to_number(optarg, 0, INT_MAX)) == -1)
 				fail(2, "illegal u_threshold specified");
 			break;
 		case 'y':
 			set_option(options, OPT_LTHRESHOLD);
-			if ((ce->dest.l_threshold =
+			if ((ce->dest.user.l_threshold =
 			     string_to_number(optarg, 0, INT_MAX)) == -1)
 				fail(2, "illegal l_threshold specified");
 			break;
@@ -712,16 +770,16 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 			*format |= FMT_EXACT;
 			break;
 		case '6':
-			if (ce->svc.fwmark) {
+			if (ce->svc.user.fwmark) {
 				ce->svc.af = AF_INET6;
-				ce->svc.netmask = 128;
+				ce->svc.user.netmask = 128;
 			} else {
 				fail(2, "-6 used before -f\n");
 			}
 			break;
 		case 'o':
 			set_option(options, OPT_ONEPACKET);
-			ce->svc.flags |= IP_VS_SVC_F_ONEPACKET;
+			ce->svc.user.flags |= IP_VS_SVC_F_ONEPACKET;
 			break;
 		case TAG_PERSISTENCE_ENGINE:
 			set_option(options, OPT_PERSISTENCE_ENGINE);
@@ -736,8 +794,8 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 			if (!(parse & SERVICE_ADDR))
 				fail(2, "illegal local address");
 			ce->laddr.af = nsvc.af;
-			ce->laddr.addr = nsvc.addr;
-			ce->laddr.__addr_v4 = nsvc.addr.ip;
+			ce->laddr.addr = nsvc.nf_addr;
+			ce->laddr.__addr_v4 = nsvc.nf_addr.ip;
 			break;
 
 			}
@@ -749,8 +807,21 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 			if (!(parse & SERVICE_ADDR))
 				fail(2, "illegal blacklist address");
 			ce->blklst.af = nsvc.af;
-			ce->blklst.addr = nsvc.addr;
-			ce->blklst.__addr_v4 = nsvc.addr.ip;
+			ce->blklst.addr = nsvc.nf_addr;
+			ce->blklst.__addr_v4 = nsvc.nf_addr.ip;
+			break;
+
+			}
+		case '2':
+			{
+			ipvs_service_t		nsvc;
+			set_option(options,OPT_WHTLST_ADDRESS);
+			parse = parse_service(optarg, &nsvc);
+			if (!(parse & SERVICE_ADDR))
+				fail(2, "illegal whitelist address");
+			ce->whtlst.af = nsvc.af;
+			ce->whtlst.addr = nsvc.nf_addr;
+			ce->whtlst.__addr_v4 = nsvc.nf_addr.ip;
 			break;
 
 			}
@@ -763,9 +834,9 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 			set_option(options, OPT_SYNPROXY);
 
 			if(!memcmp(optarg , "enable" , strlen("enable")))
-				ce->svc.flags = ce->svc.flags | IP_VS_CONN_F_SYNPROXY;
+				ce->svc.user.flags = ce->svc.user.flags | IP_VS_CONN_F_SYNPROXY;
 			else if(!memcmp(optarg , "disable" , strlen("disable")))
-				ce->svc.flags = ce->svc.flags & (~IP_VS_CONN_F_SYNPROXY);
+				ce->svc.user.flags = ce->svc.user.flags & (~IP_VS_CONN_F_SYNPROXY);
 			else
 				fail(2 , "synproxy switch must be enable or disable\n");
 
@@ -775,22 +846,32 @@ parse_options(int argc, char **argv, struct ipvs_command_entry *ce,
 			{
 			set_option(options, OPT_HASHTAG);
 
-			if (strcmp(ce->svc.sched_name, "conhash"))
+			if (strcmp(ce->svc.user.sched_name, "conhash"))
 				fail(2 , "hash target can only be set when schedule is conhash\n");
 			if (!memcmp(optarg, "sip", strlen("sip"))) {
-				set_option(options, OPT_SIPHASH);
-				ce->svc.flags = ce->svc.flags | IP_VS_SVC_F_SIP_HASH;
-				ce->svc.flags = ce->svc.flags & (~IP_VS_SVC_F_QID_HASH);
+				ce->svc.user.flags = ce->svc.user.flags | IP_VS_SVC_F_SIP_HASH;
+				ce->svc.user.flags = ce->svc.user.flags & (~IP_VS_SVC_F_QID_HASH);
 			}
 			else if (!memcmp(optarg, "qid", strlen("qid"))) {
-				if (ce->svc.protocol != IPPROTO_UDP)
+				if (ce->svc.user.protocol != IPPROTO_UDP)
 					fail(2 , "qid hash can only be set in udp service\n");
-				set_option(options, OPT_QIDHASH);
-				ce->svc.flags = ce->svc.flags | IP_VS_SVC_F_QID_HASH;
-				ce->svc.flags = ce->svc.flags & (~IP_VS_SVC_F_SIP_HASH);
+				ce->svc.user.flags = ce->svc.user.flags | IP_VS_SVC_F_QID_HASH;
+				ce->svc.user.flags = ce->svc.user.flags & (~IP_VS_SVC_F_SIP_HASH);
 			}
 			else
 				fail(2 , "hash target not support\n");
+			break;
+			}
+		case TAG_CPU:
+			{
+			set_option(options, OPT_CPU);
+			ce->cid = atoi(optarg);
+			break;
+			}
+		case TAG_CONN_EXPIRE_QUIESCENT:
+			{
+			set_option(options, OPT_EXPIRE_QUIESCENT_CONN);
+			ce->svc.user.flags = ce->svc.user.flags | IP_VS_CONN_F_EXPIRE_QUIESCENT;
 			break;
 			}
 		default:
@@ -864,11 +945,13 @@ static int process_options(int argc, char **argv, int reading_stdin)
 	memset(&ce, 0, sizeof(struct ipvs_command_entry));
 	ce.cmd = CMD_NONE;
 	/* Set the default weight 1 */
-	ce.dest.weight = 1;
+	ce.dest.user.weight = 1;
 	/* Set direct routing as default forwarding method */
-	ce.dest.conn_flags = IP_VS_CONN_F_DROUTE;
+	ce.dest.user.conn_flags = IP_VS_CONN_F_DROUTE;
 	/* Set the default persistent granularity to /32 mask */
-	ce.svc.netmask = ((u_int32_t) 0xffffffff);
+	ce.svc.user.netmask = ((u_int32_t) 0xffffffff);
+	/* Set the default cpu be master */
+	ce.cid = 0;
 
 	if (parse_options(argc, argv, &ce, &options, &format))
 		return -1;
@@ -877,21 +960,21 @@ static int process_options(int argc, char **argv, int reading_stdin)
 
 	if (ce.cmd == CMD_ADD || ce.cmd == CMD_EDIT) {
 		/* Make sure that port zero service is persistent */
-		if (!ce.svc.fwmark && !ce.svc.port &&
-		    !(ce.svc.flags & IP_VS_SVC_F_PERSISTENT) &&
-            (!strlen(ce.svc.srange) && !strlen(ce.svc.drange) &&
-             !strlen(ce.svc.iifname) && !strlen(ce.svc.oifname)))
+		if (!ce.svc.user.fwmark && !ce.svc.user.port &&
+		    !(ce.svc.user.flags & IP_VS_SVC_F_PERSISTENT) &&
+            (!strlen(ce.svc.user.srange) && !strlen(ce.svc.user.drange) &&
+             !strlen(ce.svc.user.iifname) && !strlen(ce.svc.user.oifname)))
 			fail(2, "Zero port specified "
 			     "for no-match and non-persistent service");
 
-		if (ce.svc.flags & IP_VS_SVC_F_ONEPACKET &&
-		    !ce.svc.fwmark && ce.svc.protocol != IPPROTO_UDP)
+		if (ce.svc.user.flags & IP_VS_SVC_F_ONEPACKET &&
+		    !ce.svc.user.fwmark && ce.svc.user.protocol != IPPROTO_UDP)
 			fail(2, "One-Packet Scheduling is only "
 			     "for UDP virtual services");
 
 		/* Set the default scheduling algorithm if not specified */
-		if (strlen(ce.svc.sched_name) == 0)
-			strcpy(ce.svc.sched_name, DEF_SCHED);
+		if (strlen(ce.svc.user.sched_name) == 0)
+			strcpy(ce.svc.user.sched_name, DEF_SCHED);
 	}
 
 	if (ce.cmd == CMD_STARTDAEMON && strlen(ce.daemon.mcast_ifn) == 0)
@@ -903,10 +986,10 @@ static int process_options(int argc, char **argv, int reading_stdin)
 		 * if the IP_VS_CONN_F_TUNNEL or IP_VS_CONN_F_DROUTE is set.
 		 * Don't worry about this if fwmark is used.
 		 */
-		if (!ce.svc.fwmark &&
-		    (ce.dest.conn_flags == IP_VS_CONN_F_TUNNEL
-		     || ce.dest.conn_flags == IP_VS_CONN_F_DROUTE))
-			ce.dest.port = ce.svc.port;
+		if (!ce.svc.user.fwmark &&
+		    (ce.dest.user.conn_flags == IP_VS_CONN_F_TUNNEL
+		     || ce.dest.user.conn_flags == IP_VS_CONN_F_DROUTE))
+			ce.dest.user.port = ce.svc.user.port;
 	}
 
 	switch (ce.cmd) {
@@ -924,13 +1007,13 @@ static int process_options(int argc, char **argv, int reading_stdin)
             else
                 list_conn(options & OPT_PERSISTENTCONN, format);
 		else if (options & OPT_SERVICE)
-			list_service(&ce.svc, format);
+			list_service(&ce.svc, format, ce.cid);
 		else if (options & OPT_TIMEOUT)
 			list_timeout();
 		else if (options & OPT_DAEMON)
 			list_daemon();
 		else
-			list_all(format);
+			list_all(format, ce.cid);
 		return 0;
 
 	case CMD_RESTORE:
@@ -938,7 +1021,7 @@ static int process_options(int argc, char **argv, int reading_stdin)
 
 	case CMD_SAVE:
 		format |= FMT_RULE;
-		list_all(format);
+		list_all(format, ce.cid);
 		return 0;
 
 	case CMD_FLUSH:
@@ -995,9 +1078,9 @@ static int process_options(int argc, char **argv, int reading_stdin)
 
 	case CMD_GETLADDR:
 		if(options & OPT_SERVICE)
-			result = list_laddrs(&ce.svc , 1);
+			result = list_laddrs(&ce.svc , 1, ce.cid);
 		else
-			result = list_all_laddrs();
+			result = list_all_laddrs(ce.cid);
 		break;
 
 	case CMD_ADDBLKLST:
@@ -1011,10 +1094,27 @@ static int process_options(int argc, char **argv, int reading_stdin)
 	case CMD_GETBLKLST:
 		if(options & OPT_SERVICE) {
 			list_blklsts_print_title();
-			result = list_blklst(ce.svc.addr.ip, ce.svc.port, ce.svc.protocol);
+			result = list_blklst(ce.svc.af, &ce.svc.nf_addr, ce.svc.user.port, ce.svc.user.protocol);
 		}
 		else
 			result = list_all_blklsts();
+		break;
+
+	case CMD_ADDWHTLST:
+		result = ipvs_add_whtlst(&ce.svc , &ce.whtlst);
+		break;
+
+	case CMD_DELWHTLST:
+		result = ipvs_del_whtlst(&ce.svc , &ce.whtlst);
+		break;
+
+	case CMD_GETWHTLST:
+		if(options & OPT_SERVICE) {
+			list_whtlsts_print_title();
+			result = list_whtlst(ce.svc.af, &ce.svc.nf_addr, ce.svc.user.port, ce.svc.user.protocol);
+		}
+		else
+			result = list_all_whtlsts();
 		break;
 	}
 	if (result)
@@ -1130,19 +1230,19 @@ parse_service(char *buf, ipvs_service_t *svc)
 			return SERVICE_NONE;
 	}
 	if (inet_pton(AF_INET6, buf, &inaddr6) > 0) {
-		svc->addr.in6 = inaddr6;
+		svc->nf_addr.in6 = inaddr6;
 		svc->af = AF_INET6;
-		svc->netmask = 128;
+		svc->user.netmask = 128;
 	} else {
 		portp = strrchr(buf, ':');
 		if (portp != NULL)
 			*portp = '\0';
 
 		if (inet_aton(buf, &inaddr) != 0) {
-			svc->addr.ip = inaddr.s_addr;
+			svc->nf_addr.ip = inaddr.s_addr;
 			svc->af = AF_INET;
 		} else if (host_to_addr(buf, &inaddr) != -1) {
-			svc->addr.ip = inaddr.s_addr;
+			svc->nf_addr.ip = inaddr.s_addr;
 			svc->af = AF_INET;
 		} else
 			return SERVICE_NONE;
@@ -1154,9 +1254,9 @@ parse_service(char *buf, ipvs_service_t *svc)
 		result |= SERVICE_PORT;
 
 		if ((portn = string_to_number(portp+1, 0, 65535)) != -1)
-			svc->port = htons(portn);
-		else if ((portn = service_to_port(portp+1, svc->protocol)) != -1)
-			svc->port = htons(portn);
+			svc->user.port = htons(portn);
+		else if ((portn = service_to_port(portp+1, svc->user.protocol)) != -1)
+			svc->user.port = htons(portn);
 		else
 			return SERVICE_NONE;
 	}
@@ -1167,15 +1267,15 @@ parse_service(char *buf, ipvs_service_t *svc)
  * Get sockpair from the arguments.
  * sockpair := PROTO:SIP:SPORT:TIP:TPORT
  * PROTO := [tcp|udp]
- * SIP,TIP := dotted-decimal ip address
+ * SIP,TIP := dotted-decimal ip address or square-blacketed ip6 address
  * SPORT,TPORT := range(0, 65535)
  */
 static int
 parse_sockpair(char *buf, ipvs_sockpair_t *sockpair)
 {
     char *pos = buf, *end;
-    int af = AF_INET;
-    struct in_addr sip, tip;
+    int af = (strchr(pos, '[') == NULL ? AF_INET : AF_INET6);
+    union inet_addr sip, tip;
     unsigned short proto, sport, tport;
     long portn;
 
@@ -1192,13 +1292,26 @@ parse_sockpair(char *buf, ipvs_sockpair_t *sockpair)
 	else
 		return 0;
 
-	pos = end;
-    end = strchr(pos, ':');
-    if (!end)
-        return 0;
-    *end++ = '\0';
-    if (inet_pton(af, pos, &sip) != 1)
-        return 0;
+    if (af == AF_INET) {
+        pos = end;
+        end = strchr(pos, ':');
+        if (!end)
+            return 0;
+        *end++ = '\0';
+        if (inet_pton(af, pos, &sip) != 1)
+            return 0;
+    } else {
+        if (*end != '[')
+            return 0;
+        pos = end + 1;
+        end = strchr(pos, ']');
+        if (!end || *(end+1) != ':')
+            return 0;
+        *end++ = '\0';
+        *end++ = '\0';
+        if (inet_pton(af, pos, &sip.in6) != 1)
+            return 0;
+    }
 
     pos = end;
     end = strchr(pos, ':');
@@ -1209,13 +1322,26 @@ parse_sockpair(char *buf, ipvs_sockpair_t *sockpair)
         return 0;
     sport = portn;
 
-    pos = end;
-    end = strchr(pos, ':');
-    if (!end)
-        return 0;
-    *end++ = '\0';
-    if (inet_pton(af, pos, &tip) != 1)
-        return 0;
+    if (af == AF_INET) {
+        pos = end;
+        end = strchr(pos, ':');
+        if (!end)
+            return 0;
+        *end++ = '\0';
+        if (inet_pton(af, pos, &tip.in) != 1)
+            return 0;
+    } else {
+        if (*end !='[')
+            return 0;
+        pos = end + 1;
+        end = strchr(pos, ']');
+        if (!end || *(end+1) != ':')
+            return 0;
+        *end++ = '\0';
+        *end++ = '\0';
+        if (inet_pton(af, pos, &tip.in6) != 1)
+            return 0;
+    }
 
     pos = end;
     if ((portn = string_to_number(pos, 0, 65535)) == -1)
@@ -1231,10 +1357,11 @@ parse_sockpair(char *buf, ipvs_sockpair_t *sockpair)
 
     return 1;
 }
+
 /*
  * comma separated parameters list, all fields is used to match packets.
  *
- *   proto      := tcp | udp | icmp
+ *   proto      := tcp | udp | icmp |icmpv6
  *   src-range  := RANGE
  *   dst-range  := RANGE
  *   iif        := IFNAME
@@ -1250,11 +1377,12 @@ static int parse_match_snat(const char *buf, ipvs_service_t *svc)
     char params[256];
     char *arg, *start, *sp, key[32], val[128];
     int r;
+    bool range = false;
+    bool af = false;
 
     snprintf(params, sizeof(params), "%s", buf);
 
-    svc->af = AF_INET; /* now IPv4 only */
-    svc->protocol = IPPROTO_NONE;
+    svc->user.protocol = IPPROTO_NONE;
 
     for (start = params; (arg = strtok_r(start, ",", &sp)); start = NULL) {
         r = sscanf(arg, "%31[^=]=%127s", key, val);
@@ -1266,31 +1394,45 @@ static int parse_match_snat(const char *buf, ipvs_service_t *svc)
 
         if (strcmp(key, "proto") == 0) {
             if (strcmp(val, "tcp") == 0)
-                svc->protocol = IPPROTO_TCP;
+                svc->user.protocol = IPPROTO_TCP;
             else if (strcmp(val, "udp") == 0)
-                svc->protocol = IPPROTO_UDP;
+                svc->user.protocol = IPPROTO_UDP;
             else if (strcmp(val, "icmp") == 0)
-                svc->protocol = IPPROTO_ICMP;
+                svc->user.protocol = IPPROTO_ICMP;
+            else if (strcmp(val, "icmpv6") == 0)
+                svc->user.protocol = IPPROTO_ICMPV6;
+            else
+                return -1;
+        } else if (strcmp(key, "af") == 0){
+            af = true;
+            if (strcmp(val, "ipv4") == 0)
+                svc->af = AF_INET;
+            else if (strcmp(val, "ipv6") == 0)
+                svc->af = AF_INET6;
             else
                 return -1;
         } else if (strcmp(key, "src-range") == 0) {
-            snprintf(svc->srange, sizeof(svc->srange), "%s", val);
+            range = true;
+            snprintf(svc->user.srange, sizeof(svc->user.srange), "%s", val);
         } else if (strcmp(key, "dst-range") == 0) {
-            snprintf(svc->drange, sizeof(svc->drange), "%s", val);
+            range = true;
+            snprintf(svc->user.drange, sizeof(svc->user.drange), "%s", val);
         } else if (strcmp(key, "iif") == 0) {
-            snprintf(svc->iifname, sizeof(svc->iifname), "%s", val);
+            snprintf(svc->user.iifname, sizeof(svc->user.iifname), "%s", val);
         } else if (strcmp(key, "oif") == 0) {
-            snprintf(svc->oifname, sizeof(svc->oifname), "%s", val);
+            snprintf(svc->user.oifname, sizeof(svc->user.oifname), "%s", val);
         } else {
             return -1;
         }
     }
 
+    if (!range && !af)
+        return -1;
     return 0;
 }
 
 static void
-generic_opt_check(int command, int options)
+generic_opt_check(int command, unsigned int options)
 {
 	int i, j;
 	int last = 0, count = 0;
@@ -1377,6 +1519,7 @@ static void usage_exit(const char *program, const int exit_status)
 		"  %s -P|Q -t|u|q|f service-address -z local-address\n"
 		"  %s -G -t|u|q|f service-address \n"
 		"  %s -U|V -t|u|q|f service-address -k blacklist-address\n"
+		"  %s -O|Y -t|u|q|f service-address -2 whitelist-address\n"
 		"  %s -a|e -t|u|q|f service-address -r server-address [options]\n"
 		"  %s -d -t|u|q|f service-address -r server-address\n"
 		"  %s -L|l [options]\n"
@@ -1386,7 +1529,7 @@ static void usage_exit(const char *program, const int exit_status)
 		"  %s --stop-daemon state\n"
 		"  %s -h\n\n",
 		program, program, program,
-		program, program, program,
+		program, program, program, program,
 		program, program, program, program, program,
 		program, program, program, program, program);
 
@@ -1404,6 +1547,9 @@ static void usage_exit(const char *program, const int exit_status)
 		"  --add-blklst      -U        add blacklist address\n"
 		"  --del-blklst      -V        del blacklist address\n"
 		"  --get-blklst      -B        get blacklist address\n"
+        "  --add-whtlst      -O        add whitelist address\n"
+        "  --del-whtlst      -Y        del whitelist address\n"
+        "  --get-whtlst      -W        get whitelist address\n"
 		"  --save            -S        save rules to stdout\n"
 		"  --add-server      -a        add real server with options\n"
 		"  --edit-server     -e        edit real server with options\n"
@@ -1421,6 +1567,7 @@ static void usage_exit(const char *program, const int exit_status)
 		"  --tcp-service  -t service-address   service-address is host[:port]\n"
 		"  --udp-service  -u service-address   service-address is host[:port]\n"
 		"  --icmp-service -q service-address   service-address is host[:port]\n"
+		"  --icmpv6-service -1 service-address   service-address is host[:port]\n"
 		"  --fwmark-service  -f fwmark         fwmark is an integer greater than zero\n"
 		"  --ipv6         -6                   fwmark entry uses IPv6\n"
 		"  --scheduler    -s scheduler         one of " SCHEDULERS ",\n"
@@ -1448,15 +1595,17 @@ static void usage_exit(const char *program, const int exit_status)
 		"  --exact                             expand numbers (display exact values)\n"
 		"  --thresholds                        output of thresholds information\n"
 		"  --persistent-conn                   output of persistent connection info\n"
-		"  --sockpair                          output connection info of specified socket pair (proto:sip:sport:tip:tport)"
+		"  --sockpair                          output connection info of specified socket pair (proto:sip:sport:tip:tport)\n"
 		"  --nosort                            disable sorting output of service/server entries\n"
 		"  --sort                              does nothing, for backwards compatibility\n"
 		"  --ops          -o                   one-packet scheduling\n"
 		"  --numeric      -n                   numeric output of addresses and ports\n"
 		"  --ifname       -F                   nic interface for laddrs\n"
 		"  --synproxy     -j                   TCP syn proxy\n"
-		"  --match        -H MATCH             select service by MATCH 'proto,srange,drange,iif,oif'\n"
-		"  --hash-target  -Y hashtag           choose target for conhash (support sip or qid for quic)\n",
+		"  --match        -H MATCH             select service by MATCH 'af,proto,srange,drange,iif,oif', af should be defined if no range defined\n"
+		"  --hash-target  -Y hashtag           choose target for conhash (support sip or qid for quic)\n"
+		"  --cpu            cid                choose cid to show\n"
+		"  --expire-quiescent                  expire the quiescent connections timely whose realserver went down\n",
 		DEF_SCHED);
 
 	exit(exit_status);
@@ -1509,21 +1658,25 @@ static void print_conn_entry(const ipvs_conn_entry_t *conn_entry,
 		snprintf(proto_str, sizeof(proto_str), "%s", "tcp");
 	else if (conn_entry->proto == IPPROTO_UDP)
 		snprintf(proto_str, sizeof(proto_str), "%s", "udp");
+	else if (conn_entry->proto == IPPROTO_ICMP)
+		snprintf(proto_str, sizeof(proto_str), "%s", "icmp");
+	else if (conn_entry->proto == IPPROTO_ICMPV6)
+		snprintf(proto_str, sizeof(proto_str), "%s", "icmpv6");
 	else
 		snprintf(proto_str, sizeof(proto_str), "%s", "--");
 
 	snprintf(time_str, sizeof(time_str), "%ds", conn_entry->timeout);
 
-	if (!(cname = addrport_to_anyname(conn_entry->af, &conn_entry->caddr,
+	if (!(cname = addrport_to_anyname(conn_entry->in_af, &conn_entry->caddr,
                     ntohs(conn_entry->cport), conn_entry->proto, format)))
 		goto exit;
-	if (!(vname = addrport_to_anyname(conn_entry->af, &conn_entry->vaddr,
+	if (!(vname = addrport_to_anyname(conn_entry->in_af, &conn_entry->vaddr,
                     ntohs(conn_entry->vport), conn_entry->proto, format)))
 		goto exit;
-	if (!(lname = addrport_to_anyname(conn_entry->af, &conn_entry->laddr,
+	if (!(lname = addrport_to_anyname(conn_entry->out_af, &conn_entry->laddr,
                     ntohs(conn_entry->lport), conn_entry->proto, format)))
 		goto exit;
-	if (!(dname = addrport_to_anyname(conn_entry->af, &conn_entry->daddr,
+	if (!(dname = addrport_to_anyname(conn_entry->out_af, &conn_entry->daddr,
                     ntohs(conn_entry->dport), conn_entry->proto, format)))
 		goto exit;
 
@@ -1633,11 +1786,11 @@ static inline char *fwd_switch(unsigned flags)
 }
 
 /*notice when rs is deleted svc stats count will be less than before*/
-static void copy_stats_from_dest(ipvs_service_entry_t *se, struct ip_vs_get_dests *d)
+static void copy_stats_from_dest(ipvs_service_entry_t *se, struct ip_vs_get_dests_app *d)
 {
 	int i = 0;
-	for (i = 0; i < d->num_dests; i++) {
-		ipvs_dest_entry_t *e = &d->entrytable[i];
+	for (i = 0; i < d->user.num_dests; i++) {
+		ipvs_dest_entry_t *e = &d->user.entrytable[i];
 		se->stats.conns += e->stats.conns;
 		se->stats.inpkts += e->stats.inpkts;
 		se->stats.outpkts += e->stats.outpkts;
@@ -1656,7 +1809,7 @@ static void print_largenum(unsigned long long i, unsigned int format)
 		printf("%*llu", len <= 8 ? 9 : len + 1, i);
 		return;
 	}
-	
+
 	if (i < 100000000)			/* less than 100 million */
 		printf("%9llu", i);
 	else if (i < 1000000000)		/* less than 1 billion */
@@ -1699,50 +1852,52 @@ static void print_title(unsigned int format)
 
 
 static void
-print_service_entry(ipvs_service_entry_t *se, unsigned int format)
+print_service_entry(ipvs_service_entry_t *se, unsigned int format, lcoreid_t cid)
 {
-	struct ip_vs_get_dests *d;
-	char svc_name[256];
+	struct ip_vs_get_dests_app *d;
+	char svc_name[1024];
 	int i;
 
-	if (!(d = ipvs_get_dests(se))) {
+	if (!(d = ipvs_get_dests(se, cid))) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		exit(1);
 	}
 
-	if (se->fwmark) {
+	if (se->user.fwmark) {
 		if (format & FMT_RULE)
 			if (se->af == AF_INET6)
-				sprintf(svc_name, "-f %d -6", se->fwmark);
+				sprintf(svc_name, "-f %d -6", se->user.fwmark);
 			else
-				sprintf(svc_name, "-f %d", se->fwmark);
+				sprintf(svc_name, "-f %d", se->user.fwmark);
 		else
 			if (se->af == AF_INET6)
-				sprintf(svc_name, "FWM  %d IPv6", se->fwmark);
+				sprintf(svc_name, "FWM  %d IPv6", se->user.fwmark);
 			else
-				sprintf(svc_name, "FWM  %d", se->fwmark);
-	} else if (se->__addr_v4 || se->port) {
+				sprintf(svc_name, "FWM  %d", se->user.fwmark);
+	} else if (se->user.__addr_v4 || se->user.port) {
 		char *vname, *proto;
 
-		if (!(vname = addrport_to_anyname(se->af, &se->addr, ntohs(se->port),
-						  se->protocol, format)))
+		if (!(vname = addrport_to_anyname(se->af, &se->nf_addr, ntohs(se->user.port),
+						  se->user.protocol, format)))
 			fail(2, "addrport_to_anyname: %s", strerror(errno));
 		if (format & FMT_RULE) {
-			if (se->protocol == IPPROTO_TCP)
+			if (se->user.protocol == IPPROTO_TCP)
 				proto = "-t";
-			else if (se->protocol == IPPROTO_UDP)
+			else if (se->user.protocol == IPPROTO_UDP)
 				proto = "-u";
 			else
 				proto = "-q";
 
 			sprintf(svc_name, "%s %s", proto, vname);
 		} else {
-			if (se->protocol == IPPROTO_TCP)
+			if (se->user.protocol == IPPROTO_TCP)
 				proto = "TCP";
-			else if (se->protocol == IPPROTO_UDP)
+			else if (se->user.protocol == IPPROTO_UDP)
 				proto = "UDP";
-			else
+			else if (se->user.protocol == IPPROTO_ICMP)
 				proto = "ICMP";
+			else
+				proto = "ICMPv6";
 
 			sprintf(svc_name, "%s  %s", proto, vname);
 			if (se->af != AF_INET6)
@@ -1752,17 +1907,19 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 	} else { /* match */
 		char *proto;
 
-		if (se->protocol == IPPROTO_TCP)
+		if (se->user.protocol == IPPROTO_TCP)
 			proto = "tcp";
-		else if (se->protocol == IPPROTO_UDP)
+		else if (se->user.protocol == IPPROTO_UDP)
 			proto = "udp";
-		else
+		else if (se->user.protocol == IPPROTO_ICMP)
 			proto = "icmp";
+		else
+			proto = "icmpv6";
 
 		if (format & FMT_RULE) {
 			snprintf(svc_name, sizeof(svc_name),
 			"-H proto=%s,src-range=%s,dst-range=%s,iif=%s,oif=%s",
-			proto, se->srange, se->drange, se->iifname, se->oifname);
+			proto, se->user.srange, se->user.drange, se->user.iifname, se->user.oifname);
 
 		} else {
 			int left = sizeof(svc_name);
@@ -1770,22 +1927,25 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 
 			left -= snprintf(svc_name + strlen(svc_name), left,
 				"MATCH %s", proto);
-            
-			if (strcmp(se->srange, "0.0.0.0-0.0.0.0:0-0") != 0)
-				left -= snprintf(svc_name + strlen(svc_name), left,
-				",from=%s", se->srange);
 
-			if (strcmp(se->drange, "0.0.0.0-0.0.0.0:0-0") != 0)
+			if (strcmp(se->user.srange, "[::-::]:0-0") != 0 &&
+                            strcmp(se->user.srange, "0.0.0.0-0.0.0.0:0-0") != 0)
 				left -= snprintf(svc_name + strlen(svc_name), left,
-				",to=%s", se->drange);
+				",from=%s", se->user.srange);
 
-			if (strlen(se->iifname))
+			if (strcmp(se->user.drange, "[::-::]:0-0") != 0 &&
+                            strcmp(se->user.drange, "0.0.0.0-0.0.0.0:0-0") != 0)
 				left -= snprintf(svc_name + strlen(svc_name), left,
-				",iif=%s", se->iifname);
+				",to=%s", se->user.drange);
 
-			if (strlen(se->oifname))
+			if (strlen(se->user.iifname))
 				left -= snprintf(svc_name + strlen(svc_name), left,
-				",oif=%s", se->oifname);
+				",iif=%s", se->user.iifname);
+
+			if (strlen(se->user.oifname))
+				left -= snprintf(svc_name + strlen(svc_name), left,
+				",oif=%s", se->user.oifname);
+>>>>>>> wencyu/dpdk2011-rebase
 		}
 	}
 
@@ -1794,24 +1954,24 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 
 	/* print virtual service info */
 	if (format & FMT_RULE) {
-		printf("-A %s -s %s", svc_name, se->sched_name);
-		if (se->flags & IP_VS_SVC_F_PERSISTENT) {
-			printf(" -p %u", se->timeout);
+		printf("-A %s -s %s", svc_name, se->user.sched_name);
+		if (se->user.flags & IP_VS_SVC_F_PERSISTENT) {
+			printf(" -p %u", se->user.timeout);
 			if (se->af == AF_INET)
-				if (se->netmask != (unsigned long int) 0xffffffff) {
+				if (se->user.netmask != (unsigned long int) 0xffffffff) {
 					struct in_addr mask;
-					mask.s_addr = se->netmask;
+					mask.s_addr = se->user.netmask;
 					printf(" -M %s", inet_ntoa(mask));
 				}
 			if (se->af == AF_INET6)
-				if (se->netmask != 128) {
-					printf(" -M %i", se->netmask);
+				if (se->user.netmask != 128) {
+					printf(" -M %i", se->user.netmask);
 				}
 		}
 		if (se->pe_name[0])
 			printf(" pe %s", se->pe_name);
-		if (se->flags & IP_VS_SVC_F_ONEPACKET)
-			printf(" ops");
+		if (se->user.flags & IP_VS_SVC_F_ONEPACKET)
+			printf(" --ops");
 	} else if (format & FMT_STATS) {
 		printf("%-33s", svc_name);
 		print_largenum(se->stats.conns, format);
@@ -1820,8 +1980,10 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 		print_largenum(se->stats.inbytes, format);
 		print_largenum(se->stats.outbytes, format);
 	} else if (format & FMT_RATE) {
-		if (se->bps > 0) {
-			sprintf(svc_name, "%s bps %dM", svc_name, se->bps);
+		if (se->user.bps > 0) {
+			char buf[128];
+			snprintf(buf, sizeof(buf),  " bps %dM", se->user.bps);
+			strncat(svc_name, buf, sizeof(svc_name)-strlen(svc_name)-1);
 		}
 		printf("%-33s", svc_name);
 		print_largenum(se->stats.cps, format);
@@ -1830,31 +1992,33 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 		print_largenum(se->stats.inbps, format);
 		print_largenum(se->stats.outbps, format);
 	} else {
-		printf("%s %s", svc_name, se->sched_name);
-		if (se->flags & IP_VS_SVC_F_SIP_HASH)
+		printf("%s %s", svc_name, se->user.sched_name);
+		if (se->user.flags & IP_VS_SVC_F_SIP_HASH)
 			printf(" sip");
-		if (se->flags & IP_VS_SVC_F_QID_HASH)
+		if (se->user.flags & IP_VS_SVC_F_QID_HASH)
 			printf(" qid");
-		if (se->flags & IP_VS_SVC_F_PERSISTENT) {
-			printf(" persistent %u", se->timeout);
+		if (se->user.flags & IP_VS_SVC_F_PERSISTENT) {
+			printf(" persistent %u", se->user.timeout);
 			if (se->af == AF_INET)
-				if (se->netmask != (unsigned long int) 0xffffffff) {
+				if (se->user.netmask != (unsigned long int) 0xffffffff) {
 					struct in_addr mask;
-					mask.s_addr = se->netmask;
+					mask.s_addr = se->user.netmask;
 					printf(" mask %s", inet_ntoa(mask));
 				}
 			if (se->af == AF_INET6)
-				if (se->netmask != 128)
-					printf(" mask %i", se->netmask);
+				if (se->user.netmask != 128)
+					printf(" mask %i", se->user.netmask);
 			if (se->pe_name[0])
 				printf(" pe %s", se->pe_name);
-			if (se->flags & IP_VS_SVC_F_ONEPACKET)
-				printf(" ops");
 		}
-		if (se->flags & IP_VS_CONN_F_SYNPROXY)
+		if (se->user.flags & IP_VS_SVC_F_ONEPACKET)
+			printf(" ops");
+		if (se->user.flags & IP_VS_CONN_F_SYNPROXY)
 			printf(" synproxy");
-        if (se->conn_timeout != 0)
-            printf(" conn_timeout %u", se->conn_timeout);
+		if (se->user.conn_timeout != 0)
+			printf(" conn_timeout %u", se->user.conn_timeout);
+		if (se->user.flags & IP_VS_CONN_F_EXPIRE_QUIESCENT)
+			printf(" expire-quiescent");
 	}
 	printf("\n");
 
@@ -1862,12 +2026,12 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 	if (!(format & FMT_NOSORT))
 		ipvs_sort_dests(d, ipvs_cmp_dests);
 
-	for (i = 0; i < d->num_dests; i++) {
+	for (i = 0; i < d->user.num_dests; i++) {
 		char *dname;
-		ipvs_dest_entry_t *e = &d->entrytable[i];
+		ipvs_dest_entry_t *e = &d->user.entrytable[i];
 
-		if (!(dname = addrport_to_anyname(se->af, &(e->addr), ntohs(e->port),
-						  se->protocol, format))) {
+		if (!(dname = addrport_to_anyname(e->af, &(e->nf_addr), ntohs(e->user.port),
+						  se->user.protocol, format))) {
 			fprintf(stderr, "addrport_to_anyname fails\n");
 			exit(1);
 		}
@@ -1876,7 +2040,7 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 
 		if (format & FMT_RULE) {
 			printf("-a %s -r %s %s -w %d\n", svc_name, dname,
-			       fwd_switch(e->conn_flags), e->weight);
+			       fwd_switch(e->user.conn_flags), e->user.weight);
 		} else if (format & FMT_STATS) {
 			printf("  -> %-28s", dname);
 			print_largenum(e->stats.conns, format);
@@ -1895,16 +2059,16 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 			printf("\n");
 		} else if (format & FMT_THRESHOLDS) {
 			printf("  -> %-28s %-10u %-10u %-10u %-10u\n", dname,
-			       e->u_threshold, e->l_threshold,
-			       e->activeconns, e->inactconns);
+			       e->user.u_threshold, e->user.l_threshold,
+			       e->user.activeconns, e->user.inactconns);
 		} else if (format & FMT_PERSISTENTCONN) {
 			printf("  -> %-28s %-9u %-11u %-10u %-10u\n", dname,
-			       e->weight, e->persistconns,
-			       e->activeconns, e->inactconns);
+			       e->user.weight, e->user.persistconns,
+			       e->user.activeconns, e->user.inactconns);
 		} else
 			printf("  -> %-28s %-7s %-6d %-10u %-10u\n",
-			       dname, fwd_name(e->conn_flags),
-			       e->weight, e->activeconns, e->inactconns);
+			       dname, fwd_name(e->user.conn_flags),
+			       e->user.weight, e->user.activeconns, e->user.inactconns);
 		free(dname);
 	}
 	free(d);
@@ -1912,7 +2076,7 @@ print_service_entry(ipvs_service_entry_t *se, unsigned int format)
 
 static void list_laddrs_print_title(void)
 {
-	printf("%-20s %-8s %-20s %-10s %-10s\n" , 
+	printf("%-20s %-8s %-20s %-10s %-10s\n" ,
 		"VIP:VPORT" ,
 		"TOTAL" ,
 		"SNAT_IP",
@@ -1940,10 +2104,10 @@ static void list_laddrs_print_service(struct ip_vs_get_laddrs *d)
 
 static void list_laddrs_print_laddr(struct ip_vs_laddr_entry * entry)
 {
-	char	pbuf[32];
+	char	pbuf[INET6_ADDRSTRLEN];
 
-	inet_ntop(entry->af, &entry->addr, pbuf, sizeof(pbuf));
-	
+	inet_ntop(entry->af, (char *)&entry->addr, pbuf, sizeof(pbuf));
+
 	printf("%-20s %-8s %-20s %-10lu %-10u\n",
 		"",
 		"",
@@ -1955,37 +2119,33 @@ static void list_laddrs_print_laddr(struct ip_vs_laddr_entry * entry)
 static void print_service_and_laddrs(struct ip_vs_get_laddrs* d, int with_title)
 {
 	int i = 0;
-	
 	if(with_title)
 		list_laddrs_print_title();
 
 	list_laddrs_print_service(d);
 	for(i = 0 ; i < d->num_laddrs ; i ++){
-		list_laddrs_print_laddr(d->entrytable + i); 
+		list_laddrs_print_laddr(d->entrytable + i);
 	}
 
 	return;
 }
 
 
-static int list_laddrs(ipvs_service_t *svc , int with_title)
+static int list_laddrs(ipvs_service_t *svc , int with_title, lcoreid_t cid)
 {
 	ipvs_service_entry_t *entry;
 	struct ip_vs_get_laddrs *d;
 
-	if (!(entry = ipvs_get_service(svc))) {
+	if (!(entry = ipvs_get_service(svc, cid))) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		return -1;
 	}
-
-	if (!(d = ipvs_get_laddrs(entry))) {
+	if (!(d = ipvs_get_laddrs(entry, cid))) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		free(entry);
 		return -1;
 	}	
-
 	print_service_and_laddrs(d, with_title);
-
 	free(entry);
 	free(d);
 
@@ -1993,20 +2153,19 @@ static int list_laddrs(ipvs_service_t *svc , int with_title)
 }
 
 
-static int list_all_laddrs(void)
+static int list_all_laddrs(lcoreid_t cid)
 {
-	struct ip_vs_get_services *get;
+	struct ip_vs_get_services_app *get;
 	struct ip_vs_get_laddrs   *d;
 	int i;
 	int title_enable = 1;
 
-	if (!(get = ipvs_get_services())) {
+	if (!(get = ipvs_get_services(cid))) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		return -1;
 	}
-
-	for (i = 0; i < get->num_services; i++){
-		if(!(d = ipvs_get_laddrs(&(get->entrytable[i])))) {
+	for (i = 0; i < get->user.num_services; i++){
+		if(!(d = ipvs_get_laddrs(&(get->user.entrytable[i]), cid))) {
 			free(get);
 			fprintf(stderr, "%s\n", ipvs_strerror(errno));
 			return -1;
@@ -2015,10 +2174,8 @@ static int list_all_laddrs(void)
 		if(i != 0)
 			title_enable = 0;
 		print_service_and_laddrs(d, title_enable);
-
 		free(d);
 	}
-	
 	free(get);
 	return 0;
 
@@ -2026,7 +2183,7 @@ static int list_all_laddrs(void)
 
 static void list_blklsts_print_title(void)
 {
-	printf("%-20s %-8s %-20s\n" ,
+	printf("%-20s %-8s %-20s\n",
 		"VIP:VPORT" ,
 		"PROTO" ,
 		"BLACKLIST");
@@ -2034,83 +2191,185 @@ static void list_blklsts_print_title(void)
 
 static void print_service_and_blklsts(struct dp_vs_blklst_conf *blklst)
 {
-	char pbuf_v[32], pbuf_d[32], port[6];
-	sprintf(pbuf_v , "%u.%u.%u.%u" , PRINT_NIP(blklst->vaddr.in.s_addr));
-	sprintf(pbuf_d , "%u.%u.%u.%u" , PRINT_NIP(blklst->blklst.in.s_addr));
-	sprintf(port, "%d", ntohs(blklst->vport));
-	if (blklst->proto ==IPPROTO_TCP)
-		printf("%s:%-8s %-8s %-20s\n" , pbuf_v, port, "TCP", pbuf_d);
-	else if(blklst->proto ==IPPROTO_UDP)
-		printf("%s:%-8s %-8s %-20s\n" , pbuf_v, port, "UDP", pbuf_d);
-	else
-		printf("proto not support!");
+	char vip[64], bip[64], port[8], proto[8];
+	const char *pattern = (blklst->af == AF_INET ?
+			"%s:%-8s %-8s %-20s\n" : "[%s]:%-8s %-8s %-20s\n");
+
+	switch (blklst->proto) {
+		case IPPROTO_TCP:
+			snprintf(proto, sizeof(proto), "%s", "TCP");
+			break;
+		case IPPROTO_UDP:
+			snprintf(proto, sizeof(proto), "%s", "UDP");
+			break;
+		case IPPROTO_ICMP:
+			snprintf(proto, sizeof(proto), "%s", "ICMP");
+			break;
+		case IPPROTO_ICMPV6:
+			snprintf(proto, sizeof(proto), "%s", "IMCPv6");
+			break;
+		default:
+			break;
+	}
+
+	snprintf(port, sizeof(port), "%u", ntohs(blklst->vport));
+
+	printf(pattern, inet_ntop(blklst->af, (const void *)&blklst->vaddr, vip, sizeof(vip)),
+			port, proto, inet_ntop(blklst->af, (const void *)&blklst->blklst, bip, sizeof(bip)));
 }
 
-static int list_blklst(uint32_t addr_v4, uint16_t port, uint16_t protocol)
+static bool inet_addr_equal(int af, const union nf_inet_addr *a1, const union nf_inet_addr *a2)
 {
-	struct dp_vs_blklst_conf_array *get;
+	switch (af) {
+		case AF_INET:
+			return a1->ip == a2->ip;
+		case AF_INET6:
+			return IN6_ARE_ADDR_EQUAL(a1, a2);
+		default:
+			return memcmp(a1, a2, sizeof(union nf_inet_addr)) == 0;
+    }
+}
+
+static int list_blklst(int af, const union nf_inet_addr *addr, uint16_t port, uint16_t protocol)
+{
 	int i;
+	struct dp_vs_blklst_conf_array *get;
+
 	if (!(get = ipvs_get_blklsts())) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		return -1;
 	}
 
 	for (i = 0; i < get->naddr; i++) {
-		if ( addr_v4== get->blklsts[i].vaddr.in.s_addr && 
-		     port == get->blklsts[i].vport&& 
-		     protocol == get->blklsts[i].proto) {
+		if (inet_addr_equal(af, addr,(const union nf_inet_addr *) &get->blklsts[i].vaddr) &&
+				port == get->blklsts[i].vport && protocol == get->blklsts[i].proto) {
 			print_service_and_blklsts(&get->blklsts[i]);
 		}
 	}
 	free(get);
+
 	return 0;
 }
 
 static int list_all_blklsts(void)
 {
-	struct ip_vs_get_services *get;
+	struct ip_vs_get_services_app *get;
 	int i;
 
-	if (!(get = ipvs_get_services())) {
+	if (!(get = ipvs_get_services(0))) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		exit(1);
 	}
 
 	list_blklsts_print_title();
-	for (i = 0; i < get->num_services; i++)
-		list_blklst(get->entrytable[i].__addr_v4, get->entrytable[i].port, 
-				get->entrytable[i].protocol);
-	
+	for (i = 0; i < get->user.num_services; i++)
+		list_blklst(get->user.entrytable[i].af, &get->user.entrytable[i].nf_addr,
+				get->user.entrytable[i].user.port, get->user.entrytable[i].user.protocol);
 	free(get);
 	return 0;
 }
 
-static void list_service(ipvs_service_t *svc, unsigned int format)
+static void list_whtlsts_print_title(void)
+{
+	printf("%-20s %-8s %-20s\n" ,
+	    "VIP:VPORT" ,
+		"PROTO" ,
+		"WHITELIST");
+}
+
+static void print_service_and_whtlsts(struct dp_vs_whtlst_conf *whtlst)
+{
+	char vip[64], bip[64], port[8], proto[8];
+	const char *pattern = (whtlst->af == AF_INET ?
+			"%s:%-8s %-8s %-20s\n" : "[%s]:%-8s %-8s %-20s\n");
+
+	switch (whtlst->proto) {
+		case IPPROTO_TCP:
+			snprintf(proto, sizeof(proto), "%s", "TCP");
+			break;
+		case IPPROTO_UDP:
+			snprintf(proto, sizeof(proto), "%s", "UDP");
+			break;
+		case IPPROTO_ICMP:
+			snprintf(proto, sizeof(proto), "%s", "ICMP");
+			break;
+		case IPPROTO_ICMPV6:
+			snprintf(proto, sizeof(proto), "%s", "IMCPv6");
+			break;
+		default:
+			break;
+	}
+
+	snprintf(port, sizeof(port), "%u", ntohs(whtlst->vport));
+
+	printf(pattern, inet_ntop(whtlst->af, (const void *)&whtlst->vaddr, vip, sizeof(vip)),
+			port, proto, inet_ntop(whtlst->af, (const void *)&whtlst->whtlst, bip, sizeof(bip)));
+}
+static int list_whtlst(int af, const union nf_inet_addr *addr, uint16_t port, uint16_t protocol)
+{
+	int i;
+	struct dp_vs_whtlst_conf_array *get;
+
+	if (!(get = ipvs_get_whtlsts())) {
+		fprintf(stderr, "%s\n", ipvs_strerror(errno));
+		return -1;
+	}
+
+	for (i = 0; i < get->naddr; i++) {
+		if (inet_addr_equal(af, addr,(const union nf_inet_addr *) &get->whtlsts[i].vaddr) &&
+				port == get->whtlsts[i].vport && protocol == get->whtlsts[i].proto) {
+			print_service_and_whtlsts(&get->whtlsts[i]);
+		}
+	}
+	free(get);
+
+	return 0;
+}
+
+static int list_all_whtlsts(void)
+{
+	struct ip_vs_get_services_app *get;
+	int i;
+
+	if (!(get = ipvs_get_services(0))) {
+		fprintf(stderr, "%s\n", ipvs_strerror(errno));
+		exit(1);
+	}
+
+	list_whtlsts_print_title();
+	for (i = 0; i < get->user.num_services; i++)
+		list_whtlst(get->user.entrytable[i].af, &get->user.entrytable[i].nf_addr,
+				get->user.entrytable[i].user.port, get->user.entrytable[i].user.protocol);
+	free(get);
+	return 0;
+}
+
+static void list_service(ipvs_service_t *svc, unsigned int format, lcoreid_t cid)
 {
 	ipvs_service_entry_t *entry;
 
-	if (!(entry = ipvs_get_service(svc))) {
+	if (!(entry = ipvs_get_service(svc, cid))) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		exit(1);
 	}
 
 	print_title(format);
-	print_service_entry(entry, format);
+	print_service_entry(entry, format, cid);
 	free(entry);
 
 }
 
 
-static void list_all(unsigned int format)
+static void list_all(unsigned int format, lcoreid_t cid)
 {
-	struct ip_vs_get_services *get;
+	struct ip_vs_get_services_app *get;
 	int i;
 
 	if (!(format & FMT_RULE))
 		printf("IP Virtual Server version %d.%d.%d (size=%d)\n",
-		       NVERSION(ipvs_info.version), ipvs_info.size);
+		       NVERSION(g_ipvs_info.version), g_ipvs_info.size);
 
-	if (!(get = ipvs_get_services())) {
+	if (!(get = ipvs_get_services(cid))) {
 		fprintf(stderr, "%s\n", ipvs_strerror(errno));
 		exit(1);
 	}
@@ -2119,8 +2378,8 @@ static void list_all(unsigned int format)
 		ipvs_sort_services(get, ipvs_cmp_services);
 
 	print_title(format);
-	for (i = 0; i < get->num_services; i++)
-		print_service_entry(&get->entrytable[i], format);
+	for (i = 0; i < get->user.num_services; i++)
+		print_service_entry(&get->user.entrytable[i], format, cid);
 	free(get);
 }
 
@@ -2207,6 +2466,9 @@ int service_to_port(const char *name, unsigned short proto)
 	else if (proto == IPPROTO_ICMP
 		 && (service = getservbyname(name, "icmp")) != NULL)
 		return ntohs((unsigned short) service->s_port);
+	else if (proto == IPPROTO_ICMPV6
+		 && (service = getservbyname(name, "icmpv6")) != NULL)
+		return ntohs((unsigned short) service->s_port);
 	else
 		return -1;
 }
@@ -2224,6 +2486,9 @@ static char * port_to_service(unsigned short port, unsigned short proto)
 		return service->s_name;
 	else if (proto == IPPROTO_ICMP &&
 		 (service = getservbyport(htons(port), "icmp")) != NULL)
+		return service->s_name;
+	else if (proto == IPPROTO_ICMPV6 &&
+		 (service = getservbyport(htons(port), "icmpv6")) != NULL)
 		return service->s_name;
 	else
 		return (char *) NULL;
@@ -2248,7 +2513,7 @@ static char *
 addrport_to_anyname(int af, const void *addr, unsigned short port,
 		    unsigned short proto, unsigned int format)
 {
-  char *buf, pbuf[INET6_ADDRSTRLEN];
+ 	char *buf, pbuf[INET6_ADDRSTRLEN];
 
 	if (!(buf=malloc(60)))
 		return NULL;

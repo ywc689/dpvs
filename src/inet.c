@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -28,6 +28,7 @@
 #include "icmp.h"
 #include "icmp6.h"
 #include "inetaddr.h"
+#include "ipset.h"
 
 #define INET
 #define RTE_LOGTYPE_INET RTE_LOGTYPE_USER1
@@ -81,6 +82,8 @@ int inet_init(void)
 {
     int err;
 
+    if ((err = ipset_init()) != 0)
+        return err;
     if ((err = neigh_init()) != 0)
         return err;
     if ((err = route_init()) != 0)
@@ -123,11 +126,13 @@ int inet_term(void)
         return err;
     if ((err = neigh_term()) != 0)
         return err;
+    if ((err = ipset_term()) != 0)
+        return err;
 
     return EDPVS_OK;
 }
 
-bool inet_addr_equal(int af, const union inet_addr *a1, 
+bool inet_addr_equal(int af, const union inet_addr *a1,
                      const union inet_addr *a2)
 {
     switch (af) {
@@ -166,7 +171,7 @@ int inet_plen_to_mask(int af, uint8_t plen, union inet_addr *mask)
     }
 }
 
-int inet_addr_net(int af, const union inet_addr *addr, 
+int inet_addr_net(int af, const union inet_addr *addr,
                   const union inet_addr *mask,
                   union inet_addr *net)
 {
@@ -234,8 +239,6 @@ int INET_HOOK(int af, unsigned int hook, struct rte_mbuf *mbuf,
     state.hook = hook;
     hook_list = af_inet_hooks(af, hook);
 
-    rte_rwlock_read_lock(af_inet_hook_lock(af));
-
     ops = list_entry(hook_list, struct inet_hook_ops, list);
 
     if (!list_empty(hook_list)) {
@@ -250,8 +253,6 @@ repeat:
             }
         }
     }
-
-    rte_rwlock_read_unlock(af_inet_hook_lock(af));
 
     if (verdict == INET_ACCEPT || verdict == INET_STOP) {
         return okfn(mbuf);

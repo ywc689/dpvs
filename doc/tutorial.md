@@ -13,6 +13,7 @@ DPVS Tutorial
 * [Tunnel Mode(one-arm)](#tunnel)
 * [NAT Mode(one-arm)](#nat)
 * [SNAT Mode (two-arm)](#snat)
+* [IPv6 Support](#ipv6_support)
 * [Virtual devices](#virt-dev)
   - [Bonding Device](#vdev-bond)
   - [VLAN Device](#vdev-vlan)
@@ -20,16 +21,20 @@ DPVS Tutorial
   - [KNI for virtual device](#vdev-kni)
 * [UDP Option of Address (UOA)](#uoa)
 * [Launch DPVS in Virtual Machine (Ubuntu)](#Ubuntu16.04)
+* [Traffic Control(TC)](#tc)
+* [Debug DPVS](#debug)
+  - [Debug with Log](#debug-with-log)
+  - [Packet Capture and Tcpdump](#packet-capture)
 
-> To compile and launch DPVS, pls check *README.md* for this project.
+> To compile and launch DPVS, please check [README.md](../README.md) for this project.
 
 <a id='term'/>
 
 # Terminology
 
-About the concepts of *Full-NAT* (`FNAT`), `DR`, `Tunnel`, `toa`, `OSPF`/`ECMP` and `keepalived`, pls refer [LVS](www.linuxvirtualserver.org) and [Alibaba/LVS](https://github.com/alibaba/LVS/tree/master/docs).
+About the concepts of *Full-NAT* (`FNAT`), `DR`, `Tunnel`, `TOA`, `OSPF`/`ECMP` and `keepalived`, please refer [LVS](http://www.linuxvirtualserver.org) and [Alibaba/LVS](https://github.com/alibaba/LVS/tree/master/docs).
 
-Note `DPVS` support `FNAT`, `DR`, `Tunnel`, `SNAT` forwarding modes, and each mode can be configured as `one-arm` or `two-arm` topology, with or without `OSFP/ECMP`/`keepalived`. There're too many combinations, I cannot list all the examples here. Let's just give some popular working models used in our daily work.
+Note that `DPVS` supports `FNAT`, `DR`, `Tunnel`, `NAT`, `SNAT` forwarding modes, and each mode can be configured as `one-arm` or `two-arm` topology, with or without `OSFP/ECMP`/`keepalived`. There're too many combinations, I cannot list all the examples here. Let's just give some popular working models used in our daily work.
 
 <a id='one-two-arm'/>
 
@@ -43,8 +48,8 @@ On the other hand, *one-arm* means all clients and servers are in same side of `
 
 To make things easier, we do not consider virtual devices for now. Thus, *two-arm* topology need
 
-* two DPDK interfaces loaded with `igb_uio` driver, and
-* `/etc/dpvs.conf` should also be configured with two interfaces. Pls refer the file `conf/dpvs.conf.sample`.
+* two DPDK interfaces loaded with PMD driver(i.e. igb_uio), and
+* `/etc/dpvs.conf` should also be configured with two interfaces. Please refer the file [conf/dpvs.conf.sample](../conf/dpvs.conf.sample).
 
 ```
 $ dpdk-devbind --status
@@ -55,7 +60,7 @@ Network devices using DPDK-compatible driver
 0000:06:00.1 'Ethernet Controller 10-Gigabit X540-AT2' drv=igb_uio unused=uio_pci_generic
 ```
 
-For *one-arm*, only one DPDK intreface needed, and you can refer `conf/dpvs.conf.single-nic.sample`.
+For *one-arm*, only one DPDK intreface is needed, and you can refer [conf/dpvs.conf.single-nic.sample](../conf/dpvs.conf.single-nic.sample).
 
 <a id='kni'/>
 
@@ -69,7 +74,7 @@ Considering `DPDK` application manages the networking interface completely (exce
 
 ![kni](pics/kni.png)
 
-Note, `keepalived` is modified by `DPVS` project to support some specific parameters. The codes is resident in `tools/keepalived` and the executable is `bin/keepalived`. And `ospfd`/`sshd` is the standard version.
+It should not that `keepalived` is modified by `DPVS` project to support some specific parameters. The codes is resident in [tools/keepalived](../tools/keepalived) and the executable file is `bin/keepalived`. And `ospfd`/`sshd` is the standard version.
 
 Let's start from *Full-NAT* example first, it's not the easiest but really popular.
 
@@ -163,7 +168,7 @@ Your ip:port : 10.0.0.48:37177
 
 `LIP` or *Local-IP* is needed for FNAT translation, clients' *CIP:cport* will be replaced with *LIP:lport*, while *VIP:vport* will be translated to RS's *RIP:rport*. That's why the mode called "Full-NAT" I think.
 
-Pls use `ipvsadm --add-laddr` to set `LIP` instead of `dpip addr add ...`. Because the both *ipvs* and *inet* module need `LIP` address, and *sapool* option will be set automatically.
+Please use `ipvsadm --add-laddr` to set `LIP` instead of `dpip addr add ...`. Because the both *ipvs* and *inet* module need `LIP` address, and *sapool* option will be set automatically.
 
 Another tip is you can use `dpip addr add 10.0.0.100/16 dev dpdk1` to set VIP and WAN route simultaneously. But let's use two commands to make it clear.
 
@@ -173,16 +178,20 @@ You could refer to following links to get `TOA` source code and porting to your 
 
 * [Alibaba LVS](https://github.com/alibaba/LVS/blob/master/docs/LVS_user_manual.pdf)
 * [UCloud TOA](https://docs.ucloud.cn/security/uads/faq/game)
-* [Huawai TOA](https://github.com/Huawei/TCP_option_address)
+* [Huawei TOA](https://github.com/Huawei/TCP_option_address)
 * [IPVS CA](https://github.com/yubo/ip_vs_ca)
+
+TOA source code is included into DPVS project(in directory [kmod/toa](../kmod/toa)) since v1.7 to support IPv6 and NAT64. It is derived from the Alibaba TOA. For IPv6 applications which need client's real IP address, we suggest to use this TOA version.
+
+Be aware that **application may need some changes** if you are using NAT64. An extra `getsockopt` should be called to obtain the client's real IPv6 address from the IPv4 socket on RS. As an example, we give a [NAT64 patch for nginx-1.14](../kmod/toa/example_nat64/nginx/nginx-1.14.0-nat64-toa.patch). By the way, if you do not need client's real IP address, application needs no changes.
 
 <a id='fnat-ospf'/>
 
 ## Full-NAT with OSPF/ECMP (two-arm)
 
-To work with *OSPF*, the patch in `patch/dpdk-stable-17.05.2/` must be applied to *dpdk-stable-17.05.2* and the correct `rte_kni.ko` should be installed.
+To work with *OSPF*, the patch in `patch/dpdk-xxx/` must be applied to the corresponding DPDK source codes and the correct `rte_kni.ko` should be installed.
 
-`DPVS` OSPF-cluster model looks like this, it leverage `OSPF/ECMP` for HA and high-scalability. This model is widely used in practice.
+`DPVS` OSPF-cluster model looks like this, it leverages `OSPF/ECMP` for HA and high-scalability. This model is widely used in practice.
 
 ![fnat-ospf-two-arm](pics/fnat-ospf-two-arm.png)
 
@@ -198,10 +207,10 @@ Now the configuration has two parts, one is for `dpvs` and another is for `zebra
 
 `dpvs` part is almost the same with the example in [simple fnat](#simple-fnat), except
 
-* one more route to **kni-host** is needed to pass the packets received from `dpvs` device to Linux `kni` device.
-* VIP should not set to `dpvs` by `dpip addr`, need be set to `kni` instead, so that `ospfd` can be aware of it and then to publish.
+* one more address/route is needed to communicate between dpvs and wan-side L3-switch. For ospf packets, dpvs will just send them to kernel.
+* VIP should not only set to `dpvs` by `dpip addr`, but also need to set to `kni`, so that `ospfd` can be aware of it and then to publish.
 
-> the prefix length of `kni_host` must be 32.
+> If you add any kni_host route which means all packets will be sent to kernel by dpvs, the prefix length of `kni_host` must be 32.
 
 ```bash
 #!/bin/sh -
@@ -221,13 +230,15 @@ Now the configuration has two parts, one is for `dpvs` and another is for `zebra
 ./ipvsadm --add-laddr -z 192.168.100.200 -t 123.1.2.3:80 -F dpdk0
 ./ipvsadm --add-laddr -z 192.168.100.201 -t 123.1.2.3:80 -F dpdk0
 
-# add route to kni device.
-./dpip route add 172.10.0.2/32 dev dpdk1 scope kni_host
+# add addr/route for dpvs.
+./dpip addr add 123.1.2.3/32 dev dpdk1
+./dpip addr add 172.10.0.2/30 dev dpdk1
+./dpip route add default via 172.10.0.1 dev dpdk1
 ```
 
 Then, the `zebra/ospfd` part. Firstly, run the OSPF protocol between `DPVS` server and wan-side L3-switch, with the "inter-connection network" (here is `172.10.0.2/30`). For `DPVS`, we set the inter-connection IP on `dpdk1.kni`.
 
-> Assuming `quagga` package is installed, if not, pls use 'yum' (CentOS) or 'apt-get' (Ubuntu) to install it. After installed, you should have `zebra` and `ospfd`, as well as their config files.
+> Assuming `quagga` package is installed, if not, please use 'yum' (CentOS) or 'apt-get' (Ubuntu) to install it. After installed, you should have `zebra` and `ospfd`, as well as their config files.
 
 ```bash
 $ ip link set dpdk1.kni up
@@ -275,24 +286,49 @@ For `ospfd`, these parameters need be set:
 * Other parameters, like "p2p", "authentication", ... they must be consistent with Switch.
 
 ```bash
-$ cat /etc/quagga/ospfd.conf   # may installed to other path
+$ cat /etc/quagga/ospfd.conf       # may installed to other path
 log file /var/log/quagga/ospf.log
 log stdout
 log syslog
 password ****
 enable password ****
-interface dpdk1.kni      # should be wan-side kni device
+interface dpdk1.kni                # should be wan-side kni device
 ip ospf hello-interval 10
 ip ospf dead-interval 40
 router ospf
-ospf router-id 192.168.100.200 # just use LAN IP
+ospf router-id 192.168.100.200     # just use LAN IP
 log-adjacency-changes
 auto-cost reference-bandwidth 1000
 network 172.10.0.0/30 area 0.0.0.0 # announce inter-connection network
-network 123.1.2.3/32 area 0.0.0.0 # announce VIP
+network 123.1.2.3/32 area 0.0.0.0  # announce VIP
 ```
 
-Note `OSPF` must also be configured on l3-switch. This Tutorial is not about OSPF's configuration, so no more things about switch here.
+Considering the VIP's route is configured on KNI interface, an alternative way to publish VIP is to let ospfd redistribute the connected routes that match VIP. In this way, you don't need to modify the `ospfd.conf` file and reolad `ospfd` every time when you want to add more VIPs.
+
+```bash
+$ cat /etc/quagga/ospfd.conf               # may installed to other path
+log file /var/log/quagga/ospf.log
+log stdout
+log syslog
+password ****
+enable password ****
+
+access-list 1 permit 123.1.2.0 0.0.0.255   # access-list 1 permits VIP segment 123.1.2.0/24
+route-map ecmp permit 10                   # route-map "ecmp" matches ip address from access-list 1
+match ip address 1
+
+interface dpdk1.kni                        # should be wan-side kni device
+ip ospf hello-interval 10
+ip ospf dead-interval 40
+router ospf
+ospf router-id 192.168.100.200             # just use LAN IP
+log-adjacency-changes
+auto-cost reference-bandwidth 1000
+network 172.10.0.0/30 area 0.0.0.0         # announce inter-connection network
+redistribute connected route-map ecmp      # redistribute VIPs in route-map "ecmp", route-map is not mandatory but advised
+```
+
+Note that `OSPF` must also be configured on l3-switch. This Tutorial is not about OSPF's configuration, so no more things about switch here.
 
 Now start `zebra` and `ospfd`:
 
@@ -306,6 +342,8 @@ Hopefully (if `OSPF` works), the VIP is accessible by client:
 ```bash
 client: curl 123.1.2.3
 ```
+
+> There exists other solutions to acheive the OSPF-cluster model and the like. For example, OSPF and quagga can be replaced with BGP and [bird](https://bird.network.cz/), respectively. If you are interested, please refer to related docs or consult the network administrator.
 
 <a id='fnat-keepalive'/>
 
@@ -454,7 +492,7 @@ client$ curl 192.168.100.254
 Your ip:port : 192.168.100.146:42394
 ```
 
-> We just explain how DPVS works with keepalived, and not verify if the master/backup feature provided by keepalived works. Pls refer LVS docs if needed.
+> We just explain how DPVS works with keepalived, and not verify if the master/backup feature provided by keepalived works. Please refer LVS docs if needed.
 
 <a id='dr'/>
 
@@ -513,13 +551,13 @@ client$ curl 192.168.100.254
 Your ip:port : 192.168.100.46:13862
 ```
 
-> DR mode for two-arm is similar with [two-arm FNAT](#simple-fnat), pls change the forwarding mode by `ipvsadm -g`, and you need NOT config `LIP`. Configuration of `RS`es are the same with one-arm.
+> DR mode for two-arm is similar with [two-arm FNAT](#simple-fnat), please change the forwarding mode by `ipvsadm -g`, and you need NOT config `LIP`. Configuration of `RS`es are the same with one-arm.
 
 <a id='tunnel'/>
 
 # Tunnel Mode (one-arm)
 
-Traffic flow of tunnel mode is the same as DR mode. It forwards packets to RSs, and then RSs send replies to clients directly. Different with DR mode, tunnel mode can forward packets across L2 network through ipip tunnels between DPVS and RSs.
+Traffic flow of tunnel mode is the same as DR mode. It forwards packets to RSes, and then RSes send replies to clients directly. Different with DR mode, tunnel mode can forward packets across L2 network through ipip tunnels between DPVS and RSes.
 
 ![tunnel-one-arm](./pics/tunnel-one-arm.png)
 
@@ -559,7 +597,7 @@ Hi, I am 10.40.84.170.
 
 ```
 
-<a id=`nat`/>
+<a id='nat'/>
 
 # NAT mode (one-arm)
 
@@ -581,13 +619,52 @@ Whatever, we give a simple example for NAT mode. Remind it only works single lco
 # config LAN network on bond0, routes will generate automatically
 ./dpip addr add 192.168.0.66/24 dev bond0
 ./dpip addr add 10.140.31.48/20 dev bond0
+
 # add service <VIP:vport> to forwarding, scheduling mode is RR
 ./ipvsadm -A -t 192.168.0.89:80 -s -rr
+
 # add two RSs, forwarding mode is NAT
 ./ipvsadm -A -t 192.168.0.89:80 -r 10.140.18.33 -m
 ./ipvsadm -A -t 192.168.0.89:80 -r 10.140.18.34 -m
+
 # add VIP and the route will generate automatically
 ./dpip addr add 192.168.0.89/32 dev bond0
+
+## keepalived.conf ##
+static_ipaddress {
+    192.168.0.66/24 dev bond0
+    10.140.31.48/20 dev bond0
+}
+
+virtual_server_group vip_nat {
+    192.168.0.89 80
+}
+
+virtual_server group vip_nat {
+    protocol tcp
+    lb_algo rr
+    lb_kind NAT
+
+    real server 10.140.18.33 80 {
+         weight 100
+         inhibit_on_failure
+         TCP_CHECK {
+            nb_sock_retry 2
+            connect_timeout 3
+            connect_port 80
+        }
+    }
+
+    real server 10.140.18.34 80 {
+         weight 100
+         inhibit_on_failure
+         TCP_CHECK {
+            nb_sock_retry 2
+            connect_timeout 3
+            connect_port 80
+        }
+    }
+}
 ```
 
 On RSs, back routes should be pointed to DPVS.
@@ -604,6 +681,7 @@ Hi, I am 10.140.18.33.
 client$ curl 192.168.0.89:80
 Hi, I am 10.140.18.34.
 ```
+> Since v1.7.2, a solution is made for multi-lcore NAT mode forwarding. The principle is to redirect the outbound packets to the correct lcore where its session entry reside through a global redirection table and some lockless rings. Of course, it harms performance to some degree. If you want to use it, turn on the config swtich "ipvs_defs/conn/redirect" in /etc/dpvs.conf.
 
 <a id='snat'/>
 
@@ -724,6 +802,195 @@ host$ ping www.iqiyi.com
 host$ curl www.iqiyi.com
 ```
 
+<a id='ipv6_support'/>
+
+# IPv6 Support
+
+DPVS support IPv6-IPv6 since v1.7 which means VIP/client IP/local IP/rs IP can be IPv6. You can configure IPv6 fullnat just like IPv4:
+
+```bash
+#!/bin/sh -
+
+# add VIP to WAN interface
+./dpip addr add 2001::1/128 dev dpdk1
+
+# route for WAN/LAN access
+# add routes for other network or default route if needed.
+./dpip route -6 add 2001::/64 dev dpdk1
+
+# add service <VIP:vport> to forwarding, scheduling mode is RR.
+# use ipvsadm --help for more info.
+./ipvsadm -A -t [2001::1]:80 -s rr
+
+# add two RS for service, forwarding mode is FNAT (-b)
+./ipvsadm -a -t [2001::1]:80 -r 2001::3 -b
+./ipvsadm -a -t [2001::1]:80 -r 2001::4 -b
+
+# add at least one Local-IP (LIP) for FNAT on LAN interface
+./ipvsadm --add-laddr -z 2001::2 -t [2001::1]:80 -F dpdk0
+```
+You can use commands to check what's you have set like IPv4 except route:
+
+```bash
+$./dpip route -6 show
+inet6 2001::1/128 dev dpdk0 mtu 1500 scope host
+inet6 2001::2/128 dev dpdk0 mtu 1500 scope host
+inet6 2001::/64 dev dpdk0 mtu 1500 scope link
+```
+
+You can configure IPv6 OSPF's configuration like this:
+
+```bash
+$ cat /etc/quagga/ospf6d.conf   # may installed to other path
+log file /var/log/quagga/ospf6.log
+log stdout
+log syslog
+password ****
+enable password ****
+interface dpdk1.kni
+ ipv6 ospf6 network point-to-point
+ ipv6 ospf6 hello-interval 10
+ ipv6 ospf6 dead-interval 40
+!
+router ospf6
+ router-id 192.168.100.200
+ area 0.0.0.0 range 2001::1/64 # announce VIP
+ area 0.0.0.0 range fec0::172:10:10:11/127 # announce inter-connection network
+ interface dpdk1.kni area 0.0.0.0
+!
+```
+
+If you prefer keepalived, you can configure it like this:
+```
+$ cat /etc/keepalived/keepalived.conf
+! Configuration File for keepalived
+
+global_defs {
+    notification_email {
+        foo@example.com
+    }
+    notification_email_from bar@example.com
+    smtp_server 1.2.3.4
+    smtp_connect_timeout 60
+    router_id DPVS_DEVEL
+}
+
+local_address_group laddr_g1 {
+    2001::2 dpdk0    # use DPDK interface
+}
+
+#
+# VRRP section
+#
+vrrp_instance VI_1 {
+    state MASTER                  # master
+    interface dpdk0.kni           # should be kni interface, and IPv4 should be configured for vrrp
+    dpdk_interface dpdk0          # should be DPDK interface
+    virtual_router_id 123         # VID should be unique in network
+    priority 100                  # master's priority is bigger than worker
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass ****
+    }
+
+    virtual_ipaddress {
+        2001::1
+    }
+}
+
+#
+# Virtual Server Section
+#
+virtual_server_group 2001-1-80 {
+    2001::1 80
+}
+
+virtual_server group 2001-1-80 {
+    delay_loop 3
+    lb_algo rr         # scheduling algorithm Round-Robin
+    lb_kind FNAT       # Forwarding Mode Full-NAT
+    protocol TCP       # Protocol TCP
+
+    laddr_group_name laddr_g1   # Local IP group-ID
+
+    real_server 2001::3 80 { # real-server
+        weight 100
+        inhibit_on_failure
+        TCP_CHECK {    # health check
+            nb_sock_retry 2
+            connect_timeout 3
+            connect_port 80
+        }
+    }
+
+    real_server 2001::4 80 { # real-server
+        weight 100
+        inhibit_on_failure
+        TCP_CHECK { # health check
+            nb_sock_retry 2
+            connect_timeout 3
+            connect_port 80
+        }
+    }
+}
+```
+
+DPVS supports IPv6-IPv4 for fullnat, which means VIP/client IP can be IPv6 and local IP/rs IP can be IPv4, you can configure it like this:
+
+```bash
+#!/bin/sh -
+# add VIP to WAN interface
+./dpip addr add 2001::1/128 dev dpdk1
+
+# route for WAN/LAN access
+# add routes for other network or default route if needed.
+./dpip route -6 add 2001::/64 dev dpdk1
+./dpip route add 10.0.0.0/8 dev dpdk0
+
+# add service <VIP:vport> to forwarding, scheduling mode is RR.
+# use ipvsadm --help for more info.
+./ipvsadm -A -t [2001::1]:80 -s rr
+
+# add two RS for service, forwarding mode is FNAT (-b)
+./ipvsadm -a -t [2001::1]:80 -r 10.0.0.1 -b
+./ipvsadm -a -t [2001::1]:80 -r 10.0.0.2 -b
+
+# add at least one Local-IP (LIP) for FNAT on LAN interface
+./ipvsadm --add-laddr -z 10.0.0.3 -t [2001::1]:80 -F dpdk0
+```
+OSPF can just be configured like IPv6-IPv6. If you prefer keepalived, you can configure it like IPv6-IPv6 except real_server/local_address_group.
+
+**IPv6 and Flow Director**
+
+We found there exists some NICs do not (fully) support Flow Director for IPv6.
+For example, 82599 10GE Controller do not support IPv6 *perfect mode*, and IPv4/IPv6 *signature mode* supports only one locall IP.
+
+If you would like to use Flow Director signature mode, add the following lines into the device configs of `dpvs.conf`:
+
+```
+fdir {
+    mode                signature
+    pballoc             64k
+    status              matched
+}
+```
+
+Another method to avoid Flow Director problem is to use the redirect forwarding, which forwards the recieved packets to the right lcore where the session resides by using lockless DPDK rings.
+If you want to try this method, turn on the `redirect` switch in the `dpvs.conf`.
+
+```
+ipvs_defs {
+    conn {
+        ......
+        redirect    on
+    }
+    ......
+}
+```
+It should note that the redirect forwarding may harm performance to a certain degree. Keep it in `off` state unless you have no other solutions.
+
+
 <a id='virt-dev'/>
 
 # Virtual Devices
@@ -734,7 +1001,7 @@ host$ curl www.iqiyi.com
 
 ## Bonding Device
 
-For Bonding device, both `DPVS` and connected Switch/Router need to set the Bonding interfaces with *same* Bonding mode. Note `DPVS` just supports bonding mode 0 and 4 for now. To enable Bonding device on `DPVS`, pls refer `conf/dpvs.bond.conf.sample`. Each Bonding device needs one or more DPDK Physical device (`dpdk0`, ...) to work as it's slaves.
+For Bonding device, both `DPVS` and connected Switch/Router need to set the Bonding interfaces with *same* Bonding mode. Note that `DPVS` just supports bonding mode 0 and 4 for now. To enable Bonding device on `DPVS`, please refer [conf/dpvs.bond.conf.sample](../conf/dpvs.bond.conf.sample). Each Bonding device needs one or more DPDK Physical devices (`dpdk0`, ...) to work as its slaves.
 
 <a id='vdev-vlan'/>
 
@@ -742,7 +1009,7 @@ For Bonding device, both `DPVS` and connected Switch/Router need to set the Bond
 
 To use *VLAN* device, you can use `dpip` tool, *VLAN* device can be created based on real DPDK Physical device (e.g., `dpdk0`, `dpdk1`) or Bonding device (e.g., `bond0`). But cannot create VLAN device on VLAN device.
 
-This is the VLAN example, pls check `dpip vlan help` for more info.
+This is the VLAN example, please check `dpip vlan help` for more info.
 
 ```bash
 $ dpip vlan add dpdk0.100 link dpdk0 proto 802.1q id 100
@@ -755,7 +1022,7 @@ $ dpip vlan add link bond1 id 103
 
 ## Tunnel Device
 
-`DPVS` support tunnel devices, including `IP-in-IP` and `GRE` tunnel. This can be used for example "SNAT-GRE" cluster, remote host use tunnel to access Internet through `DPVS` SNAT cluster.
+`DPVS` support tunnel devices, including `IP-in-IP` and `GRE` tunnel. This can be used for example "SNAT-GRE" cluster, remote hosts use tunnel to access Internet through `DPVS` SNAT cluster.
 
 Setting up tunnel device is just like what we do on Linux, use `dpip` instead of `ip(8)`.
 
@@ -763,17 +1030,38 @@ Setting up tunnel device is just like what we do on Linux, use `dpip` instead of
 $ dpip tunnel add mode ipip ipip1 local 1.1.1.1 remote 2.2.2.2
 $ dpip tunnel add gre1 mode gre local 1.1.1.1 remote 2.2.2.2 dev dpdk0
 ```
+You can also use keepalived to configure tunnel instead of using ipvsadm.
 
-Pls also check `dpip tunnel help` for details.
+```
+tunnel_group tunnel_gre {
+    tunnel_entry gre100 {
+        kind gre
+        local 10.62.5.10
+        remote 10.62.5.20
+    }
+    tunnel_entry gre200 {
+        kind gre
+        local 10.62.5.10
+        remote 10.62.6.10
+   }
+   tunnel_entry gre300 {
+        kind gre
+        local 10.62.5.10
+        remote 10.62.6.11
+   }
+}
+```
 
-> Pls Note, by using Tunnel
+Please also check `dpip tunnel help` for details.
+
+> Notes:
 > 1. RSS schedule all packets to same queue/CPU since underlay source IP may the same.
->    if one lcore's `sa_pool` get full, `sa_miss` happens.
+>    If one lcore's `sa_pool` gets full, `sa_miss` happens. This is not a problem for some NICs which support inner RSS for tunnelling.
 > 2. `fdir`/`rss` won't works well on tunnel deivce, do not use tunnel for FNAT.
 
 <a id='vdev-kni'/>
 
-## KNI for Banding/VLAN
+## KNI for Bonding/VLAN
 
 Like DPDK Physical device, the *Bonding* and *VLAN* Virtual devices (e.g., `bond0` and `dpdk0.100`) have their own related `KNI` devices on Linux environment (e.g., `bond0.kni`, `dpdk0.100.kni`).
 
@@ -794,25 +1082,25 @@ To achieve this,
 1. The kernel module `uoa.ko` is needed to be installed on `RS`, and
 2. the program on `RS` just need a `getsockopt(2)` call to get the real client IP/port.
 
-The example C code for RS to fetch Real Client IP can be found [here](../uoa/example/udp_serv.c).
+The example C code for RS to fetch Real Client IP can be found [here](../kmod/uoa/example/udp_serv.c).
 
 ```bash
-rs$ insmod `uoa`
+rs$ insmod uoa.ko
 rs$ cat /proc/net/uoa_stats
  Success     Miss  Invalid|UOA  Got     None    Saved Ack-Fail
 12866352 317136864        0  3637127 341266254  3628560        0
 ```
 
-Statistics are supported for debug purpose. Note `recvfrom(2)` is kept untouched, it will still return the source IP/port in packets, means the IP/port modified or translated by `DPVS` in UDP `FNAT` mode.
-It's useful to send the data back by socket. Pls note UDP socket is connect-less, one `socket-fd` can be used to communicate with different peers.
+Statistics are supported for debug purpose. Note that `recvfrom(2)` is kept untouched, it will still return the source IP/port in packets, means the IP/port modified or translated by `DPVS` in UDP `FNAT` mode.
+It's useful to send the data back by socket. Please note UDP socket is connect-less, one `socket-fd` can be used to communicate with different peers.
 
-Actually, we use private IP option to implement `UOA`, pls check the details in [uoa.md](../uoa/uoa.md).
+Actually, we use private IP option to implement `UOA` at first, and later we add another implementation with private protocol, please check the details in [uoa.md](../kmod/uoa/uoa.md).
 
 <a id='Ubuntu16.04'/>
 
 # Launch DPVS in Virtual Machine (Ubuntu)
 
-### DPDK build and install
+1. **DPDK build and install**
 
 Before DPDK build and install ,fix code for ubuntu in vm
 
@@ -821,18 +1109,18 @@ $ cd dpdk-stable-17.05.2/
 $ sed -i "s/pci_intx_mask_supported(dev)/pci_intx_mask_supported(dev)||true/g" lib/librte_eal/linuxapp/igb_uio/igb_uio.c
 ```
 
-Now to set up DPDK hugepage,for more messages ( single-node system) pls refer the [link](http://dpdk.org/doc/guides/linux_gsg/sys_reqs.html).
+Now to set up DPDK hugepage,for more messages ( single-node system) please refer the [link](http://dpdk.org/doc/guides/linux_gsg/sys_reqs.html).
 
 ```bash
 $ # for single node machine
 $ echo 1024 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
 ```
 
-## Build DPVS on Ubuntu
+2. **Build DPVS on Ubuntu**
 
-> may need install dependencies, like `openssl`, `popt` and `numactl`, e.g., ` apt-get install libpopt-dev libssl-dev libnuma-dev` (Ubuntu).
+> may need to install dependencies, like `openssl`, `popt` and `numactl`, e.g., ` apt-get install libpopt-dev libssl-dev libnuma-dev` (Ubuntu). Also note that certain CPU flags must be enabled such as `SSSE3`.
 
-## Launch DPVS on Ubuntu
+3. **Launch DPVS on Ubuntu**
 
 Now, `dpvs.conf` must be put at `/etc/dpvs.conf`, just copy it from `conf/dpvs.conf.single-nic.sample`.
 
@@ -840,7 +1128,7 @@ Now, `dpvs.conf` must be put at `/etc/dpvs.conf`, just copy it from `conf/dpvs.c
 $ cp conf/dpvs.conf.single-nic.sample /etc/dpvs.conf
 ```
 
-The NIC for Ubuntu may not support flow-director(fdir),for that case ,pls use 'single worker',may decrease conn_pool_size .
+The NIC for Ubuntu may not support flow-director(fdir),for that case ,please use 'single worker',may decrease conn_pool_size .
 
 ```bash
 queue_number        1
@@ -862,4 +1150,282 @@ worker_defs {
         }
     }
 
+```
+
+<a id='tc'/>
+
+# Traffic Control(TC)
+
+Please refer to doc [tc.md](tc.md).
+
+<a id='debug'/>
+
+# Debug DPVS
+
+When `DPVS` is not working as expected, please consider the following debug solutions, listed with the order from easy to hard.
+
+* Enable more logs.
+* Packet capture analysis.
+* Source-code debug using `gdb` or something the like.
+
+We don't want to cover the source-code debug in detail as it's nothing special with debuging any other userspace programs. Just turn on `DEBUG` flag defined in [src/Makefile](../src/Makefile), recompile DPVS, and gdb it step by step. It's the most basic and effective debug solution despite that it requires some knowledge about DPVS source codes and debug skills.
+
+<a id='debug-with-log'/>
+
+## Debug with Log
+
+Firstly, DPVS runs with `WARNING` log level by default. You can change it in `/etc/dpvs.conf` and reload DPVS with `kill -SIGHUP`. DPVS supports 8 log levels listed below.
+
+* EMERG
+* ALERT
+* CRIT
+* ERR
+* WARNING
+* NOTICE
+* INFO
+* DEBUG
+
+Use low level log such as "INFO" or "DEBUG" may help find more clues to your problem.
+
+Secondly, some modules support more detailed debug log only if you enable it when compile DPVS. The supported flags are defined but commented in [src/config.mk](../src/config.mk), some of which are listed below. Uncomment it and recompile DPVS if you need to debug the corresponding module.
+
+```
+- CONFIG_DPVS_IPVS_DEBUG    # for ipvs forwarding debug
+- CONFIG_RECORD_BIG_LOOP    # for performance tuning
+- CONFIG_TIMER_MEASURE      # for timer accuracy debug
+- CONFIG_TIMER_DEBUG        # for dpvs timer debug
+- CONFIG_MSG_DEBUG          # for dpvs lcore msg and ipc debug
+- CONFIG_DPVS_MBUF_DEBUG    # for mbuf debug
+- CONFIG_DPVS_NEIGH_DEBUG   # for neighbor module debug
+- CONFIG_NDISC_DEBUG        # for ndisc module debug
+- CONFIG_DPVS_SAPOOL_DEBUG  # for sapool module debug
+- CONFIG_SYNPROXY_DEBUG     # for syn-proxy debug
+- CONFIG_DPVS_MP_DEBUG      # for memory pool debug
+- ... ...
+```
+
+> Note that logs may influence performance a lot. Turn off debug log in production environments is strongly advised.
+
+<a id='packet-capture'/>
+
+## Packet Capture and Tcpdump
+
+Since DPVS is driven with DPDK PMD driver and kernel-bypass, tradiontial packet capture tool like `tcpdump`, `wireshark` cannot work directly with DPVS. DPVS supports two mechanisms for packet capture: forward-to-kni, and dpdk-pdump.
+
+> Note: Both packet capture mechanisms affect performance a lot. Do **NOT** enable them in production environments!
+
+We make use of the following test case to explain the two packet capture mechanisms.
+
+```bash
+# cat pkt-cap.sh 
+#!/bin/bash
+
+./bin/dpvs &
+sleep 40                                                          # wait for DPVS up
+
+./bin/dpip addr add 192.168.88.12/24 dev dpdk0                    # Host IP address
+./bin/dpip addr add 192.168.88.100/32 dev dpdk0                   # VIP
+
+./bin/ipvsadm -A -t 192.168.88.100:80 -s mh
+./bin/ipvsadm -a -t 192.168.88.100:80 -r 192.168.88.15:80 -b      # FNAT mode
+./bin/ipvsadm -Pt 192.168.88.100:80 -z 192.168.88.241 -F dpdk0    # Local IP address
+```
+
+Check the configurations after running the script successfully.
+
+```bash
+$ ./bin/dpip addr show -s
+inet 192.168.88.12/24 scope global dpdk0
+     valid_lft forever preferred_lft forever
+inet 192.168.88.100/32 scope global dpdk0
+     valid_lft forever preferred_lft forever
+inet 192.168.88.241/32 scope global dpdk0
+     valid_lft forever preferred_lft forever sa_used 0 sa_free 1032176 sa_miss 0
+$ ./bin/dpip route show
+inet 192.168.88.12/32 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope host metric 0 proto auto 
+inet 192.168.88.100/32 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope host metric 0 proto auto 
+inet 192.168.88.241/32 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope host metric 0 proto auto 
+inet 192.168.88.0/24 via 0.0.0.0 src 192.168.88.12 dev dpdk0 mtu 1500 tos 0 scope link metric 0 proto auto 
+$ ./bin/ipvsadm -ln
+IP Virtual Server version 0.0.0 (size=0)
+Prot LocalAddress:Port Scheduler Flags
+  -> RemoteAddress:Port           Forward Weight ActiveConn InActConn
+TCP  192.168.88.100:80 mh
+  -> 192.168.88.15:80             FullNat 1      0          0 
+```
+
+### Foward-to-KNI
+
+The idea is to copy all inbound and outbound packets (mbufs) on DPDK ports and deliver them to corresponding KNI devices. Then capture packets with `tcdpump` on KNI devices. The feature can be enabled/disabled by `dpip link` command.
+
+```bash
+dpip link set <port> forward2kni on      # enable forward2kni on <port>
+dpip link set <port> forward2kni off     # disable forward2kni on <port>
+```
+
+As with our test case, firstly set up KNI interface and enable its `forward2kni`.
+
+```bash
+$ ip link set dpdk0.kni up                    # just setup dpdk0.kni, do not configure IP
+$ ./bin/dpip link set dpdk0 forward2kni on    # enable forward2kni on dpdk0
+```
+
+Then capture packets of IPv4 of network 192.168.88.0/24 using `tcpdump` on `dpdk0.kni`.
+
+```bash
+$ tcpdump -i dpdk0.kni -nn ip and net 192.168.88
+```
+
+Finally, generate ICMP traffic targeted at host IP 192.168.88.12 and HTTP traffic targeted at TCP service 192.168.88.100:80 from client 192.168.88.15.
+
+```bash
+[client ~]$ ping -c 1 192.168.88.12
+PING 192.168.88.12 (192.168.88.12) 56(84) bytes of data.
+64 bytes from 192.168.88.12: icmp_seq=1 ttl=64 time=0.039 ms
+
+--- 192.168.88.12 ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 0.039/0.039/0.039/0.000 ms
+[client ~]$ curl 192.168.88.100
+nginx 192.168.88.15
+```
+
+Check tcpdump output then, it shows that ICMP host ping packets, and the whole HTTP flow are captured by `tcpdump` working on interface `dpdk0.kni`. Note that both inbound and outbound packets are captured.
+
+```bash
+$ tcpdump -i dpdk0.kni -nn ip and net 192.168.88
+tcpdump: WARNING: dpdk0.kni: no IPv4 address assigned
+tcpdump: verbose output suppressed, use -v or -vv for full protocol decode
+listening on dpdk0.kni, link-type EN10MB (Ethernet), capture size 65535 bytes
+17:26:25.188675 IP 192.168.88.15 > 192.168.88.12: ICMP echo request, id 27103, seq 1, length 64
+17:26:25.188680 IP 192.168.88.12 > 192.168.88.15: ICMP echo reply, id 27103, seq 1, length 64
+17:26:26.738676 IP 192.168.88.15.51540 > 192.168.88.100.80: Flags [S], seq 2648360207, win 29200, options [mss 1460,nop,nop,sackOK,nop,wscale 9], length 0
+17:26:26.738681 IP 192.168.88.241.1030 > 192.168.88.15.80: Flags [S], seq 3258245864, win 29200, options [exp-c954,mss 1460,nop,nop,sackOK,nop,wscale 9], length 0
+17:26:26.739676 IP 192.168.88.15.80 > 192.168.88.241.1030: Flags [S.], seq 2951500348, ack 3258245865, win 29200, options [mss 1460,nop,nop,sackOK,nop,wscale 9], length 0
+17:26:26.739679 IP 192.168.88.100.80 > 192.168.88.15.51540: Flags [S.], seq 2951500348, ack 2648360208, win 29200, options [mss 1452,nop,nop,sackOK,nop,wscale 9], length 0
+17:26:26.739680 IP 192.168.88.15.51540 > 192.168.88.100.80: Flags [.], ack 1, win 58, length 0
+17:26:26.739682 IP 192.168.88.241.1030 > 192.168.88.15.80: Flags [.], ack 1, win 58, options [exp-c954], length 0
+17:26:26.739683 IP 192.168.88.15.51540 > 192.168.88.100.80: Flags [P.], seq 1:79, ack 1, win 58, length 78
+17:26:26.739685 IP 192.168.88.241.1030 > 192.168.88.15.80: Flags [P.], seq 1:79, ack 1, win 58, options [exp-c954], length 78
+17:26:26.739686 IP 192.168.88.15.80 > 192.168.88.241.1030: Flags [.], ack 79, win 58, length 0
+17:26:26.739687 IP 192.168.88.100.80 > 192.168.88.15.51540: Flags [.], ack 79, win 58, length 0
+17:26:26.739688 IP 192.168.88.15.80 > 192.168.88.241.1030: Flags [P.], seq 1:273, ack 79, win 58, length 272
+17:26:26.739690 IP 192.168.88.100.80 > 192.168.88.15.51540: Flags [P.], seq 1:273, ack 79, win 58, length 272
+17:26:26.739691 IP 192.168.88.15.51540 > 192.168.88.100.80: Flags [.], ack 273, win 60, length 0
+17:26:26.739692 IP 192.168.88.241.1030 > 192.168.88.15.80: Flags [.], ack 273, win 60, length 0
+17:26:26.739693 IP 192.168.88.15.51540 > 192.168.88.100.80: Flags [F.], seq 79, ack 273, win 60, length 0
+17:26:26.739695 IP 192.168.88.241.1030 > 192.168.88.15.80: Flags [F.], seq 79, ack 273, win 60, length 0
+17:26:26.739696 IP 192.168.88.15.80 > 192.168.88.241.1030: Flags [F.], seq 273, ack 80, win 58, length 0
+17:26:26.739697 IP 192.168.88.100.80 > 192.168.88.15.51540: Flags [F.], seq 273, ack 80, win 58, length 0
+17:26:26.739698 IP 192.168.88.15.51540 > 192.168.88.100.80: Flags [.], ack 274, win 60, length 0
+17:26:26.739699 IP 192.168.88.241.1030 > 192.168.88.15.80: Flags [.], ack 274, win 60, length 0
+^C
+22 packets captured
+22 packets received by filter
+0 packets dropped by kernel
+$ 
+```
+
+### dpdk-pdump
+
+The `dpdk-pdump` runs as a DPDK secondary process and is capable of enabling packet capture on dpdk ports. DPVS works as the primary process for dpdk-pdump, which shoud enable the packet capture framework by setting `global_defs/pdump` to be `on` in `/etc/dpvs.conf` when DPVS starts up. 
+
+Refer to [dpdk-pdump doc](https://doc.dpdk.org/guides/tools/pdump.html) for its usage. DPVS extends dpdk-pdump with a [DPDK patch](../patch/dpdk-stable-18.11.2/0005-enable-pdump-and-change-dpdk-pdump-tool-for-dpvs.patch) to add some packet filtering features. Run `dpdk-pdump  -- --help` to find all supported pdump params.
+
+> usage: dpdk-pdump [EAL options] -- --pdump '(port=<port id> | device_id=<pci id or vdev name>),(queue=<queue_id>),(rx-dev=<iface or pcap file> | tx-dev=<iface or pcap file>,[host=<ipaddress> | src-host=<source ip address> |dst-host=<destination ip address>],[proto=<protocol type>support:tcp/udp/icmp],[proto-port=<protocol port> |src-port=<source protocol port> |dst-port=<destination protocol port>],[ring-size=<ring size>default:16384],[mbuf-size=<mbuf data size>default:2176],[total-num-mbufs=<number of mbufs>default:65535]'
+
+Well, it's time to demonstrate how to use dpdk-pdump with our test case.
+
+Firstly, run DPVS with `pdump` set to be `on` in `/etc/dpvs.conf`.
+
+Then, start `dpdk-pdump` process on DPVS server. We run `dpdk-pdump` twice to filter out ICMP packets and TCP packets and saved them into files `icmp.pcap` and `tcp.pcap`, respectively.
+
+```bash
+$ dpdk-pdump -- --pdump 'port=0,queue=*,proto=icmp,rx-dev=/tmp/icmp.pcap,tx-dev=/tmp/icmp.pcap'
+EAL: Detected 20 lcore(s)
+EAL: Detected 2 NUMA nodes
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket_20402_295556cb3dae020
+EAL: Probing VFIO support...
+EAL: PCI device 0000:06:00.0 on NUMA socket 0
+EAL:   probe driver: 8086:1528 net_ixgbe
+EAL: PCI device 0000:06:00.1 on NUMA socket 0
+EAL:   probe driver: 8086:1528 net_ixgbe
+EAL: PCI device 0000:84:00.0 on NUMA socket 1
+EAL:   probe driver: 8086:1528 net_ixgbe
+EAL: PCI device 0000:84:00.1 on NUMA socket 1
+EAL:   probe driver: 8086:1528 net_ixgbe
+Port 1 MAC: 02 70 63 61 70 00
+^C
+
+Signal 2 received, preparing to exit...
+##### PDUMP DEBUG STATS #####
+ -packets dequeued:                     2
+ -packets transmitted to vdev:          2
+ -packets freed:                        0
+$ dpdk-pdump -- --pdump 'port=0,queue=*,proto=tcp,rx-dev=/tmp/tcp.pcap,tx-dev=/tmp/tcp.pcap'
+EAL: Detected 20 lcore(s)
+EAL: Detected 2 NUMA nodes
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket_20821_2955576eb96ab61
+EAL: Probing VFIO support...
+EAL: PCI device 0000:06:00.0 on NUMA socket 0
+EAL:   probe driver: 8086:1528 net_ixgbe
+EAL: PCI device 0000:06:00.1 on NUMA socket 0
+EAL:   probe driver: 8086:1528 net_ixgbe
+EAL: PCI device 0000:84:00.0 on NUMA socket 1
+EAL:   probe driver: 8086:1528 net_ixgbe
+EAL: PCI device 0000:84:00.1 on NUMA socket 1
+EAL:   probe driver: 8086:1528 net_ixgbe
+Port 1 MAC: 02 70 63 61 70 01
+^C
+
+Signal 2 received, preparing to exit...
+##### PDUMP DEBUG STATS #####
+ -packets dequeued:                     20
+ -packets transmitted to vdev:          20
+ -packets freed:                        0
+```
+
+In the meanwhile, generate ICMP traffic targeted at host IP 192.168.88.12 and HTTP traffic targeted at TCP service 192.168.88.100:80 from client 192.168.88.15.
+
+```bash
+$ ping -c 1 192.168.88.12
+PING 192.168.88.12 (192.168.88.12) 56(84) bytes of data.
+64 bytes from 192.168.88.12: icmp_seq=1 ttl=64 time=0.097 ms
+
+--- 192.168.88.12 ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 0.097/0.097/0.097/0.000 ms
+$ curl 192.168.88.100    
+nginx 192.168.88.15
+```
+
+Finally, we can check the pcap files of captured packets with `tcpdump` or `wireshark`.
+
+```bash
+$ tcpdump -nn -r /tmp/icmp.pcap 
+reading from file /tmp/icmp.pcap, link-type EN10MB (Ethernet)
+18:21:01.327633 IP 192.168.88.15 > 192.168.88.12: ICMP echo request, id 35422, seq 1, length 64
+18:21:01.327679 IP 192.168.88.12 > 192.168.88.15: ICMP echo reply, id 35422, seq 1, length 64
+$ tcpdump -nn -r /tmp/tcp.pcap 
+reading from file /tmp/tcp.pcap, link-type EN10MB (Ethernet)
+18:21:22.572153 IP 192.168.88.15.53186 > 192.168.88.100.80: Flags [S], seq 889492797, win 29200, options [mss 1460,nop,nop,sackOK,nop,wscale 9], length 0
+18:21:22.572203 IP 192.168.88.241.1028 > 192.168.88.15.80: Flags [S], seq 3216285976, win 29200, options [exp-cfc2,mss 1460,nop,nop,sackOK,nop,wscale 9], length 0
+18:21:22.572243 IP 192.168.88.15.80 > 192.168.88.241.1028: Flags [S.], seq 1294831393, ack 3216285977, win 29200, options [mss 1460,nop,nop,sackOK,nop,wscale 9], length 0
+18:21:22.572248 IP 192.168.88.100.80 > 192.168.88.15.53186: Flags [S.], seq 1294831393, ack 889492798, win 29200, options [mss 1452,nop,nop,sackOK,nop,wscale 9], length 0
+18:21:22.572286 IP 192.168.88.15.53186 > 192.168.88.100.80: Flags [.], ack 1, win 58, length 0
+18:21:22.572288 IP 192.168.88.241.1028 > 192.168.88.15.80: Flags [.], ack 1, win 58, options [exp-cfc2], length 0
+18:21:22.572339 IP 192.168.88.15.53186 > 192.168.88.100.80: Flags [P.], seq 1:79, ack 1, win 58, length 78
+18:21:22.572340 IP 192.168.88.241.1028 > 192.168.88.15.80: Flags [P.], seq 1:79, ack 1, win 58, options [exp-cfc2], length 78
+18:21:22.572384 IP 192.168.88.15.80 > 192.168.88.241.1028: Flags [.], ack 79, win 58, length 0
+18:21:22.572385 IP 192.168.88.100.80 > 192.168.88.15.53186: Flags [.], ack 79, win 58, length 0
+18:21:22.572452 IP 192.168.88.15.80 > 192.168.88.241.1028: Flags [P.], seq 1:273, ack 79, win 58, length 272
+18:21:22.572454 IP 192.168.88.100.80 > 192.168.88.15.53186: Flags [P.], seq 1:273, ack 79, win 58, length 272
+18:21:22.572481 IP 192.168.88.15.53186 > 192.168.88.100.80: Flags [.], ack 273, win 60, length 0
+18:21:22.572482 IP 192.168.88.241.1028 > 192.168.88.15.80: Flags [.], ack 273, win 60, length 0
+18:21:22.572556 IP 192.168.88.15.53186 > 192.168.88.100.80: Flags [F.], seq 79, ack 273, win 60, length 0
+18:21:22.572557 IP 192.168.88.241.1028 > 192.168.88.15.80: Flags [F.], seq 79, ack 273, win 60, length 0
+18:21:22.572590 IP 192.168.88.15.80 > 192.168.88.241.1028: Flags [F.], seq 273, ack 80, win 58, length 0
+18:21:22.572591 IP 192.168.88.100.80 > 192.168.88.15.53186: Flags [F.], seq 273, ack 80, win 58, length 0
+18:21:22.572619 IP 192.168.88.15.53186 > 192.168.88.100.80: Flags [.], ack 274, win 60, length 0
+18:21:22.572620 IP 192.168.88.241.1028 > 192.168.88.15.80: Flags [.], ack 274, win 60, length 0
 ```

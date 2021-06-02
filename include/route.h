@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -24,7 +24,7 @@
 
 #include "list.h"
 #include "netif.h"
-#include "common.h"
+#include "conf/common.h"
 #include "flow.h"
 
 struct route_entry {
@@ -64,7 +64,9 @@ int route_flush(void);
 static inline void route4_put(struct route_entry *route)
 {
     if(route){
-        rte_atomic32_dec(&route->refcnt);
+        if (rte_atomic32_dec_and_test(&route->refcnt)) {
+            rte_free(route);
+        }
     }
 }
 
@@ -79,7 +81,7 @@ static inline uint32_t __attribute__((pure))
         depth_to_mask(uint8_t depth)
 {
     if (depth>0) {
-        return (int)0x80000000 >> (depth - 1); 
+        return (int)0x80000000 >> (depth - 1);
     }
     else
         return (int)0x0;
@@ -103,4 +105,5 @@ int route_del(struct in_addr* dest,uint8_t netmask, uint32_t flag,
               struct in_addr* gw, struct netif_port *port,
               struct in_addr* src, unsigned long mtu,short metric);
 
+struct route_entry *route_gfw_net_lookup(const struct in_addr *dest);
 #endif

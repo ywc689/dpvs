@@ -1,7 +1,7 @@
 /*
  * DPVS is a software load balancer (Virtual Server) based on DPDK.
  *
- * Copyright (C) 2017 iQIYI (www.iqiyi.com).
+ * Copyright (C) 2021 iQIYI (www.iqiyi.com).
  * All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -24,7 +24,7 @@
 #include <netinet/ip.h>
 #include <linux/if_ether.h>
 #include "list.h"
-#include "common.h"
+#include "conf/common.h"
 #include "netif.h"
 #include "ipv4.h"
 #include "icmp.h"
@@ -161,6 +161,12 @@ static struct netif_port *tunnel_create(struct ip_tunnel_tab *tab,
     assert(tab && ops && par);
     params = *par; /* may modified */
 
+    if (netif_port_count() >= NETIF_MAX_PORTS) {
+        RTE_LOG(ERR, TUNNEL, "%s: exceeding specification limits(%d)",
+            __func__, NETIF_MAX_PORTS);
+        return NULL;
+    }
+
     /* set ifname template if not assigned. */
     if (!strlen(params.ifname))
         snprintf(params.ifname, IFNAMSIZ, "%s%%d", ops->kind);
@@ -191,7 +197,7 @@ static struct netif_port *tunnel_create(struct ip_tunnel_tab *tab,
                                set before tunnel_bind_dev */
     if (tnl->link) {
         dev->flag |= tnl->link->flag;
-        ether_addr_copy(&tnl->link->addr, &dev->addr);
+        rte_ether_addr_copy(&tnl->link->addr, &dev->addr);
     }
     dev->flag |= NETIF_PORT_FLAG_RUNNING; /* XXX */
     dev->flag |= NETIF_PORT_FLAG_NO_ARP;
@@ -327,7 +333,7 @@ static int tunnel_update_pmtu(struct netif_port *dev, struct rte_mbuf *mbuf,
     else
         mtu = rt->mtu ? : dev->mtu;
 
-    if (mbuf->packet_type == ETHER_TYPE_IPv4) {
+    if (mbuf->packet_type == RTE_ETHER_TYPE_IPV4) {
         if ((iiph->frag_off & htons(IP_DF)) && mtu < pkt_size) {
             icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, htonl(mtu));
             return EDPVS_FRAG;
@@ -343,8 +349,10 @@ static int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
     struct iphdr *oiph; /* outter IP header */
 
     oiph = (struct iphdr *)rte_pktmbuf_prepend(mbuf, sizeof(*oiph));
-    if (!oiph)
+    if (!oiph) {
+        rte_pktmbuf_free(mbuf);
         return EDPVS_NOROOM;
+    }
 
     oiph->version   = 4;
     oiph->ihl       = sizeof(struct iphdr) >> 2;
@@ -354,7 +362,7 @@ static int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
     oiph->daddr     = dst;
     oiph->saddr     = src;
     oiph->ttl       = ttl;
-    oiph->id        = ip4_select_id((struct ipv4_hdr *)oiph);
+    oiph->id        = ip4_select_id((struct rte_ipv4_hdr *)oiph);
 
     return ipv4_local_out(mbuf);
 }
@@ -386,7 +394,7 @@ static int tunnel_so_set(sockoptid_t opt, const void *arg, size_t inlen)
             return EDPVS_INVAL;
         }
     }
-    
+
     if (!ops && (opt == SOCKOPT_TUNNEL_ADD || opt == SOCKOPT_TUNNEL_REPLACE)) {
         RTE_LOG(ERR, TUNNEL, "%s: cannot determine tunnel mode\n", __func__);
         return EDPVS_INVAL;
@@ -450,7 +458,7 @@ static int tunnel_so_get(sockoptid_t opt, const void *arg, size_t inlen,
     assert(params && inlen >= sizeof(*params) && out && outlen);
 
     rte_rwlock_read_lock(&ip_tunnel_lock);
-    
+
     /* device name is indicated */
     if (strlen(params->ifname)) {
         dev = netif_port_get_by_name(params->ifname);
@@ -681,7 +689,7 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_tab *tab,
             remote != tnl->params.iph.daddr ||
             !(tnl->dev->flag & NETIF_PORT_FLAG_RUNNING))
             continue;
-        
+
         if (!tunnel_key_match(&tnl->params, flags, key))
             continue;
 
@@ -797,7 +805,7 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
 
     assert(mbuf && dev && tiph);
 
-    if (mbuf->packet_type == ETHER_TYPE_IPv4)
+    if (mbuf->packet_type == RTE_ETHER_TYPE_IPV4)
         iiph = rte_pktmbuf_mtod_offset(mbuf, struct iphdr *, tnl->hlen);
 
     connected = tiph->daddr != 0;
@@ -844,7 +852,7 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
 
     /* refer route in mbuf and this reference will be put later. */
     route4_get(rt);
-    mbuf->userdata = (void *)rt;
+    MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
 
     err = tunnel_update_pmtu(dev, mbuf, rt, tiph->frag_off, iiph);
     if (err != EDPVS_OK)
