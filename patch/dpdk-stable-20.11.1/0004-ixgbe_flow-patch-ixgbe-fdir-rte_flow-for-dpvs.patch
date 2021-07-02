@@ -1,6 +1,6 @@
-From 751a9edc37e9d7337d450794e4d44ae688fe51a9 Mon Sep 17 00:00:00 2001
+From fc81d45d6bf23bd6d9b0e7eb9fdc7fe41b559e65 Mon Sep 17 00:00:00 2001
 From: huangyichen <huangyichen@iqiyi.com>
-Date: Fri, 2 Jul 2021 10:48:05 +0800
+Date: Fri, 2 Jul 2021 11:55:47 +0800
 Subject: [PATCH 4/5] ixgbe_flow: patch ixgbe fdir rte_flow for dpvs
 
 1. Ignore fdir flow rule priority attribute.
@@ -14,7 +14,7 @@ Subject: [PATCH 4/5] ixgbe_flow: patch ixgbe fdir rte_flow for dpvs
  1 file changed, 105 insertions(+), 14 deletions(-)
 
 diff --git a/drivers/net/ixgbe/ixgbe_flow.c b/drivers/net/ixgbe/ixgbe_flow.c
-index 9aeb2e4..0c2bed9 100644
+index 9aeb2e4..481a06f 100644
 --- a/drivers/net/ixgbe/ixgbe_flow.c
 +++ b/drivers/net/ixgbe/ixgbe_flow.c
 @@ -2,7 +2,6 @@
@@ -41,7 +41,7 @@ index 9aeb2e4..0c2bed9 100644
 +		 * DPVS filted by fdir is expected,
 +		 * With dpvs single worker mode pattern had set:
 +		 * -----------------------------------------------
-+ 		 * ITEM		Spec			Mask
++		 * ITEM		Spec			Mask
 +		 * ETH		NULL			NULL
 +		 * IPV4|6	src_addr	0	0
 +		 *		dst_addr	laddr	0xFFFFFFFF
@@ -49,7 +49,7 @@ index 9aeb2e4..0c2bed9 100644
 +		 * 		dst_port	0	0
 +		 * END
 +		 * -----------------------------------------------
-+		 * It should return error here 
++		 * It should return error here
 +		 * And continue by ixgbe_parse_fdir_filter()
 +		 * */
 +		if (tcp_spec->hdr.dst_port == 0 &&
@@ -71,7 +71,7 @@ index 9aeb2e4..0c2bed9 100644
 +		 * DPVS filted by fdir is expected,
 +		 * With dpvs single worker mode pattern had set:
 +		 * -----------------------------------------------
-+ 		 * ITEM		Spec			Mask
++		 * ITEM		Spec			Mask
 +		 * ETH		NULL			NULL
 +		 * IPV4|6	src_addr	0	0
 +		 *		dst_addr	laddr	0xFFFFFFFF
@@ -79,7 +79,7 @@ index 9aeb2e4..0c2bed9 100644
 +		 * 		dst_port	0	0
 +		 * END
 +		 * -----------------------------------------------
-+		 * It should return error here 
++		 * It should return error here
 +		 * And continue by ixgbe_parse_fdir_filter()
 +		 * */
 +
