@@ -30,11 +30,13 @@
 #include "ipvs/synproxy.h"
 #include "ipvs/proto_tcp.h"
 #include "ipvs/proto_udp.h"
+#include "ipvs/proto_sctp.h"
 #include "ipvs/proto_icmp.h"
 #include "parser/parser.h"
 #include "ctrl.h"
 #include "conf/conn.h"
 #include "sys_time.h"
+#include "global_data.h"
 
 #define DPVS_CONN_TBL_BITS          20
 #define DPVS_CONN_TBL_SIZE          (1 << DPVS_CONN_TBL_BITS)
@@ -387,7 +389,7 @@ static int dp_vs_conn_bind_dest(struct dp_vs_conn *conn,
     return EDPVS_OK;
 }
 
-static int dp_vs_conn_unbind_dest(struct dp_vs_conn *conn)
+static int dp_vs_conn_unbind_dest(struct dp_vs_conn *conn, bool timerlock)
 {
     struct dp_vs_dest *dest = conn->dest;
 
@@ -406,7 +408,7 @@ static int dp_vs_conn_unbind_dest(struct dp_vs_conn *conn)
         dest->flags &= ~DPVS_DEST_F_OVERLOAD;
     }
 
-    dp_vs_dest_put(dest);
+    dp_vs_dest_put(dest, timerlock);
 
     conn->dest = NULL;
     return EDPVS_OK;
@@ -504,8 +506,8 @@ static void dp_vs_conn_put_nolock(struct dp_vs_conn *conn);
 
 unsigned dp_vs_conn_get_timeout(struct dp_vs_conn *conn)
 {
-    if (conn && conn->dest)
-        return conn->dest->conn_timeout;
+    if (conn && conn->dest && conn->dest->svc)
+        return conn->dest->svc->conn_timeout;
 
     return 0;
 }
@@ -516,7 +518,9 @@ void dp_vs_conn_set_timeout(struct dp_vs_conn *conn, struct dp_vs_proto *pp)
 
     /* set proper timeout */
     if ((conn->proto == IPPROTO_TCP && conn->state == DPVS_TCP_S_ESTABLISHED)
-        || (conn->proto == IPPROTO_UDP && conn->state == DPVS_UDP_S_NORMAL)) {
+            || conn->proto == IPPROTO_UDP
+            || (conn->proto == IPPROTO_SCTP && 
+               conn->state == DPVS_SCTP_S_ESTABLISHED)) {
         conn_timeout = dp_vs_conn_get_timeout(conn);
 
         if (conn_timeout > 0) {
@@ -555,7 +559,7 @@ static int dp_vs_conn_resend_packets(struct dp_vs_conn *conn,
                             "%s: no memory for syn_proxy rs's syn retransmit\n",
                             __func__);
                 } else {
-                    cloned_syn_mbuf->userdata = NULL;
+                    MBUF_USERDATA(cloned_syn_mbuf, void *, MBUF_FIELD_ROUTE) = NULL;
                     conn->packet_xmit(pp, conn, cloned_syn_mbuf);
                 }
             }
@@ -668,7 +672,7 @@ static int dp_vs_conn_expire(void *priv)
 
     /* refcnt == 1 means we are the only referer.
      * no one is using the conn and it's timed out. */
-    if (rte_atomic32_read(&conn->refcnt) == 1) {
+    if (rte_atomic32_sub_return(&conn->refcnt, 1) == 0) {
         dp_vs_conn_detach_timer(conn, false);
 
         /* I was controlled by someone */
@@ -679,11 +683,9 @@ static int dp_vs_conn_expire(void *priv)
             pp->conn_expire(pp, conn);
 
         dp_vs_conn_sa_release(conn);
-        dp_vs_conn_unbind_dest(conn);
+        dp_vs_conn_unbind_dest(conn, false);
         dp_vs_laddr_unbind(conn);
         dp_vs_conn_free_packets(conn);
-
-        rte_atomic32_dec(&conn->refcnt);
 
 #ifdef CONFIG_DPVS_IPVS_STATS_DEBUG
         conn_stats_dump("del conn", conn);
@@ -695,16 +697,15 @@ static int dp_vs_conn_expire(void *priv)
         dp_vs_conn_free(conn);
 
         return DTIMER_STOP;
+    } else {
+        dp_vs_conn_hash(conn);
+
+        /* some one is using it when expire,
+         * try del it again later */
+        dp_vs_conn_refresh_timer(conn, false);
+
+        return DTIMER_OK;
     }
-
-    dp_vs_conn_hash(conn);
-
-    /* some one is using it when expire,
-     * try del it again later */
-    dp_vs_conn_refresh_timer(conn, false);
-
-    rte_atomic32_dec(&conn->refcnt);
-    return DTIMER_OK;
 }
 
 void dp_vs_conn_expire_now(struct dp_vs_conn *conn)
@@ -774,7 +775,7 @@ static void conn_flush(void)
 
                         saddr6->sin6_family = AF_INET6;
                         saddr6->sin6_addr = conn->vaddr.in6;
-                        saddr6->sin6_port = conn->cport;
+                        saddr6->sin6_port = conn->vport;
                     } else {
                         RTE_LOG(WARNING, IPVS, "%s: conn address family %d "
                                 "not supported!\n", __func__, conn->af);
@@ -783,7 +784,7 @@ static void conn_flush(void)
                               (struct sockaddr_storage *)&saddr);
                 }
 
-                dp_vs_conn_unbind_dest(conn);
+                dp_vs_conn_unbind_dest(conn, true);
                 dp_vs_laddr_unbind(conn);
                 rte_atomic32_dec(&conn->refcnt);
 
@@ -878,7 +879,11 @@ struct dp_vs_conn *dp_vs_conn_new(struct rte_mbuf *mbuf,
     else
         new->daddr  = dest->addr;
     new->dport  = rport;
-    new->outwall = param->outwall;
+
+    if (dest->fwdmode == DPVS_FWD_MODE_FNAT) {
+        new->pp_version = dest->svc->proxy_protocol;
+        new->pp_sent = 0;
+    }
 
     /* neighbour confirm cache */
     if (AF_INET == tuplehash_in(new).af) {
@@ -986,7 +991,7 @@ struct dp_vs_conn *dp_vs_conn_new(struct rte_mbuf *mbuf,
 unbind_laddr:
     dp_vs_laddr_unbind(new);
 unbind_dest:
-    dp_vs_conn_unbind_dest(new);
+    dp_vs_conn_unbind_dest(new, true);
 errout:
     dp_vs_conn_free(new);
     return NULL;
@@ -1216,9 +1221,8 @@ static int conn_term_lcore(void *arg)
     if (!rte_lcore_is_enabled(rte_lcore_id()))
         return EDPVS_DISABLED;
 
-    conn_flush();
-
     if (this_conn_tbl) {
+        conn_flush();
         rte_free(this_conn_tbl);
         this_conn_tbl = NULL;
     }
@@ -1239,8 +1243,6 @@ struct ip_vs_conn_array_list {
     ipvs_conn_entry_t array[0];
 };
 
-static uint8_t g_slave_lcore_nb;
-static uint64_t g_slave_lcore_mask;
 static struct list_head conn_to_dump;
 
 static inline char* get_conn_state_name(uint16_t proto, uint16_t state)
@@ -1288,6 +1290,12 @@ static inline char* get_conn_state_name(uint16_t proto, uint16_t state)
             break;
         case IPPROTO_UDP:
             switch (state) {
+                case DPVS_UDP_S_NONE:
+                    return "UDP_NONE";
+                    break;
+                case DPVS_UDP_S_ONEWAY:
+                    return "UDP_ONEWAY";
+                    break;
                 case DPVS_UDP_S_NORMAL:
                     return "UDP_NORM";
                     break;
@@ -1299,6 +1307,39 @@ static inline char* get_conn_state_name(uint16_t proto, uint16_t state)
                     break;
             }
             break;
+        case IPPROTO_SCTP:
+            switch (state) {
+            case DPVS_SCTP_S_NONE:
+                return "SCTP_NONE";
+            case DPVS_SCTP_S_INIT1:
+                return "SCTP_INIT1";
+            case DPVS_SCTP_S_INIT:
+                return "SCTP_INIT";
+            case DPVS_SCTP_S_COOKIE_SENT:
+                return "SCTP_COOKIE_SENT";
+            case DPVS_SCTP_S_COOKIE_REPLIED:
+                return "SCTP_COOKIE_REPLIED";
+            case DPVS_SCTP_S_COOKIE_WAIT:
+                return "SCTP_COOKIE_WAIT";
+            case DPVS_SCTP_S_COOKIE:
+                return "SCTP_COOKIE";
+            case DPVS_SCTP_S_COOKIE_ECHOED:
+                return "SCTP_COOKIE_ECHOED";
+            case DPVS_SCTP_S_ESTABLISHED:
+                return "SCTP_ESTABLISHED";
+            case DPVS_SCTP_S_SHUTDOWN_SENT:
+                return "SCTP_SHUTDOWN_SENT";
+            case DPVS_SCTP_S_SHUTDOWN_RECEIVED:
+                return "SCTP_SHUTDOWN_RECEIVED";
+            case DPVS_SCTP_S_SHUTDOWN_ACK_SENT:
+                return "SCTP_SHUTDOWN_ACK_SENT";
+            case DPVS_SCTP_S_REJECTED:
+                return "SCTP_REJECTED";
+            case DPVS_SCTP_S_CLOSED:
+                return "SCTP_CLOSED";
+            default:
+                return "SCTP_UNKNOWN";
+            }
         case IPPROTO_ICMP:
         case IPPROTO_ICMPV6:
             switch (state) {
@@ -1413,17 +1454,21 @@ static int __lcore_conn_table_dump(const struct list_head *cplist)
             }
             sockopt_fill_conn_entry(conn, &cparr->array[cparr->tail++]);
             if (cparr->tail >= MAX_CTRL_CONN_GET_ENTRIES) {
+#ifdef CONFIG_DPVS_IPVS_STATS_DEBUG
                 RTE_LOG(DEBUG, IPVS, "%s: adding %d elems to conn_to_dump list -- "
                         "%p:%d-%d\n", __func__, cparr->tail - cparr->head, cparr,
                         cparr->head, cparr->tail);
+#endif
                 list_add_tail(&cparr->ca_list, &conn_to_dump);
             }
         }
     }
     if (cparr && cparr->tail < MAX_CTRL_CONN_GET_ENTRIES) {
+#ifdef CONFIG_DPVS_IPVS_STATS_DEBUG
         RTE_LOG(DEBUG, IPVS, "%s: adding %d elems to conn_to_dump list -- "
                 "%p:%d-%d\n", __func__, cparr->tail - cparr->head, cparr,
                 cparr->head, cparr->tail);
+#endif
         list_add_tail(&cparr->ca_list, &conn_to_dump);
     }
     return EDPVS_OK;
@@ -1439,9 +1484,11 @@ static int sockopt_conn_get_all(const struct ip_vs_conn_req *conn_req,
 
 again:
     list_for_each_entry_safe(larr, next_larr, &conn_to_dump, ca_list) {
+#ifdef CONFIG_DPVS_IPVS_STATS_DEBUG
         RTE_LOG(DEBUG, IPVS, "%s: printing conn_to_dump list(len=%d) --"
                 "%p:%d-%d\n", __func__, list_elems(&conn_to_dump), larr,
                 larr->head, larr->tail);
+#endif
         n = larr->tail - larr->head;
         assert(n > 0);
         if (n > MAX_CTRL_CONN_GET_ENTRIES - got) {
@@ -1477,7 +1524,7 @@ again:
     }
 
     if ((conn_req->flag & GET_IPVS_CONN_FLAG_TEMPLATE)
-            && (cid == rte_get_master_lcore())) { /* persist conns */
+            && (cid == rte_get_main_lcore())) { /* persist conns */
         rte_spinlock_lock(&dp_vs_ct_lock);
         res = __lcore_conn_table_dump(dp_vs_ct_tbl);
         rte_spinlock_unlock(&dp_vs_ct_lock);
@@ -1737,7 +1784,6 @@ static int conn_ctrl_init(void)
     int err;
 
     INIT_LIST_HEAD(&conn_to_dump);
-    netif_get_slave_lcores(&g_slave_lcore_nb, &g_slave_lcore_mask);
 
     if ((err = register_conn_get_msg()) != EDPVS_OK)
         return err;
@@ -1789,8 +1835,8 @@ int dp_vs_conn_init(void)
      * RTE_PER_LCORE() can only access own instances.
      * it make codes looks strange.
      */
-    rte_eal_mp_remote_launch(conn_init_lcore, NULL, SKIP_MASTER);
-    RTE_LCORE_FOREACH_SLAVE(lcore) {
+    rte_eal_mp_remote_launch(conn_init_lcore, NULL, SKIP_MAIN);
+    RTE_LCORE_FOREACH_WORKER(lcore) {
         if ((err = rte_eal_wait_lcore(lcore)) < 0) {
             RTE_LOG(WARNING, IPVS, "%s: lcore %d: %s.\n",
                     __func__, lcore, dpvs_strerror(err));
@@ -1829,8 +1875,8 @@ int dp_vs_conn_term(void)
 
     /* no API opposite to rte_mempool_create() */
 
-    rte_eal_mp_remote_launch(conn_term_lcore, NULL, SKIP_MASTER);
-    RTE_LCORE_FOREACH_SLAVE(lcore) {
+    rte_eal_mp_remote_launch(conn_term_lcore, NULL, SKIP_MAIN);
+    RTE_LCORE_FOREACH_WORKER(lcore) {
         rte_eal_wait_lcore(lcore);
     }
 

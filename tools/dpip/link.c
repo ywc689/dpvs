@@ -101,8 +101,10 @@ static inline int get_netif_port_list(void)
     if (g_nic_list)
         free(g_nic_list);
     g_nic_list = calloc(1, len);
-    if (!g_nic_list)
+    if (!g_nic_list) {
+        dpvs_sockopt_msg_free((void *)p_port_list);
         return EDPVS_NOMEM;
+    }
 
     memcpy(g_nic_list, p_port_list, len);
 
@@ -126,8 +128,8 @@ static void link_help(void)
             "    dpip link set DEV-NAME ITEM VALUE\n"
             "    ---supported items---\n"
             "    promisc [on|off], forward2kni [on|off], link [up|down],\n"
-            "    tc-egress [on|off], tc-ingress [on|off], addr, \n"
-            "    bond-[mode|slave|primary|ximit-policy|monitor-interval|link-up-prop|"
+            "    allmulticast [on|off], tc-egress [on|off], tc-ingress [on|off], addr, \n"
+            "    bond-[mode|slave|primary|xmit-policy|monitor-interval|link-up-prop|"
             "link-down-prop]\n"
 
             "Examples:\n"
@@ -246,6 +248,9 @@ static int dump_nic_basic(char *name, int namelen)
     if (get.promisc)
         printf("promisc ");
 
+    if (get.allmulticast)
+        printf("allmulticast ");
+
     if (get.fwd2kni)
         printf("foward2kni ");
 
@@ -301,6 +306,28 @@ static int dump_nic_stats(char *name, int namelen)
     return EDPVS_OK;
 }
 
+static void dump_nic_xstats(char *name, int namelen)
+{
+    int i, err;
+    size_t len = 0;
+    netif_nic_xstats_get_t *get = NULL;
+
+    printf("    xstats list:\n");
+    err = dpvs_getsockopt(SOCKOPT_NETIF_GET_PORT_XSTATS, name, namelen,
+            (void **)&get, &len);
+    if (err != EDPVS_OK || !get || !len) {
+        printf("        not supported\n");
+        return;
+    }
+
+    for (i = 0; i < get->nentries; i++) {
+        printf("        %-6lu%s: %lu\n", get->entries[i].id, get->entries[i].name,
+                get->entries[i].val);
+    }
+
+    dpvs_sockopt_msg_free(get);
+}
+
 static int dump_nic_verbose(char *name, int namelen)
 {
     int err;
@@ -350,16 +377,20 @@ static int dump_nic_verbose(char *name, int namelen)
             ext_get->dev_info.speed_capa);
 
     if (ext_get->cfg_queues.data_len) {
-        assert(ext_get->cfg_queues.data_len == strlen(ext_get->data +
-                    ext_get->cfg_queues.data_offset));
         printf("    Queue Configuration:\n%s", ext_get->data +
                 ext_get->cfg_queues.data_offset);
+        if (ext_get->cfg_queues.data_len > strlen(ext_get->data +
+                    ext_get->cfg_queues.data_offset)) {
+            printf("     ... (truncated)\n");
+        }
     }
 
     if (ext_get->mc_list.data_len) {
-        assert(ext_get->mc_list.data_len == strlen(ext_get->data +
-                    ext_get->mc_list.data_offset));
         printf("    HW mcast list:\n%s", ext_get->data + ext_get->mc_list.data_offset);
+        if (ext_get->mc_list.data_len > strlen(ext_get->data +
+                    ext_get->mc_list.data_offset)) {
+            printf("     ... (truncated)\n");
+        }
     }
 
     dpvs_sockopt_msg_free(ext_get);
@@ -472,6 +503,7 @@ static int dump_bond_status(char *name, int namelen)
             p_get->link_up_prop_delay);
     if (p_get->slave_nb > NETIF_MAX_BOND_SLAVES) {
         printf("too many slaves: %d\n", p_get->slave_nb);
+        dpvs_sockopt_msg_free(p_get);
         return EDPVS_INVAL;
     }
     for (i = 0; i < p_get->slave_nb; i++) {
@@ -485,6 +517,7 @@ static int dump_bond_status(char *name, int namelen)
     }
     printf("\n");
 
+    dpvs_sockopt_msg_free(p_get);
     return EDPVS_OK;
 }
 
@@ -646,6 +679,9 @@ static int link_nic_show(struct link_param *param)
             if ((err = dump_nic_stats_velocity(param->dev_name, sizeof(param->dev_name),
                         param->stats.interval, param->stats.count)) != EDPVS_OK)
                 return err;
+        }
+        if (param->verbose) {
+            dump_nic_xstats(param->dev_name, sizeof(param->dev_name));
         }
     }
     if (param->verbose)
@@ -809,6 +845,25 @@ static int link_nic_set_promisc(const char *name, const char *value)
         cfg.promisc_off = 1;
     else {
         fprintf(stderr, "invalid arguement value for 'promisc'\n");
+        return EDPVS_INVAL;
+    }
+
+    return dpvs_setsockopt(SOCKOPT_NETIF_SET_PORT, &cfg, sizeof(netif_nic_set_t));
+}
+
+static int link_nic_set_allmulticast(const char *name, const char *value)
+{
+    assert(value);
+
+    netif_nic_set_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strncpy(cfg.pname, name, sizeof(cfg.pname) - 1);
+    if (strcmp(value, "on") == 0)
+        cfg.allmulticast_on = 1;
+    else if(strcmp(value, "off") == 0)
+        cfg.allmulticast_off = 1;
+    else {
+        fprintf(stderr, "invalid arguement value for 'allmulticast'\n");
         return EDPVS_INVAL;
     }
 
@@ -1114,6 +1169,8 @@ static int link_set(struct link_param *param)
         {
             if (strcmp(param->item, "promisc") == 0)
                 link_nic_set_promisc(param->dev_name, param->value);
+            else if (strcmp(param->item, "allmulticast") == 0)
+                link_nic_set_allmulticast(param->dev_name, param->value);
             else if (strcmp(param->item, "forward2kni") == 0)
                 link_nic_set_forward2kni(param->dev_name, param->value);
             else if (strcmp(param->item, "link") == 0)

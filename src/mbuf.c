@@ -21,6 +21,8 @@
  * it includes some mbuf related functions beyond dpdk mbuf API.
  */
 #include <assert.h>
+#include <rte_mbuf_dyn.h>
+#include <rte_net.h>
 #include "mbuf.h"
 #include "inet.h"
 #include "ipv4.h"
@@ -29,12 +31,26 @@
 #define EMBUF
 #define RTE_LOGTYPE_EMBUF    RTE_LOGTYPE_USER1
 
+#define MBUF_DYNFIELDS_MAX   8
+static int mbuf_dynfields_offset[MBUF_DYNFIELDS_MAX];
+
+void *mbuf_userdata(struct rte_mbuf *mbuf, mbuf_usedata_field_t field)
+{
+    return (void *)mbuf + mbuf_dynfields_offset[field];
+}
+
+void *mbuf_userdata_const(const struct rte_mbuf *mbuf, mbuf_usedata_field_t field)
+{
+    return (void *)mbuf + mbuf_dynfields_offset[field];
+}
+
 /**
  * mbuf_may_pull - pull bits from segments to heading mbuf if needed.
  * see pskb_may_pull() && __pskb_pull_tail().
  *
  * it expands heading mbuf, moving it's tail forward and copying necessary
  * data from segments part.
+ *
  */
 int mbuf_may_pull(struct rte_mbuf *mbuf, unsigned int len)
 {
@@ -107,12 +123,13 @@ void mbuf_copy_metadata(struct rte_mbuf *mi, struct rte_mbuf *m)
     mi->nb_segs = 1;
     mi->ol_flags = m->ol_flags & (~IND_ATTACHED_MBUF);
     mi->packet_type = m->packet_type;
-    mi->userdata = NULL;
+    mbuf_userdata_reset(mi);
 
     __rte_mbuf_sanity_check(mi, 1);
     __rte_mbuf_sanity_check(m, 0);
 }
 
+/* deprecated: replace it with rte_pktmbuf_copy */
 struct rte_mbuf *mbuf_copy(struct rte_mbuf *md, struct rte_mempool *mp)
 {
     struct rte_mbuf *mc, *mi, **prev;
@@ -153,7 +170,7 @@ inline void dp_vs_mbuf_dump(const char *msg, int af, const struct rte_mbuf *mbuf
 {
     char stime[SYS_TIME_STR_LEN];
     char sbuf[64], dbuf[64];
-    struct ipv4_hdr *iph;
+    struct rte_ipv4_hdr *iph;
     union inet_addr saddr, daddr;
     __be16 _ports[2], *ports;
 
@@ -176,3 +193,150 @@ inline void dp_vs_mbuf_dump(const char *msg, int af, const struct rte_mbuf *mbuf
         ntohs(ports[1]));
 }
 #endif
+
+int mbuf_init(void)
+{
+    int i, offset;
+
+    const struct rte_mbuf_dynfield rte_mbuf_userdata_fields[] = {
+        [ MBUF_FIELD_PROTO ] = {
+            .name = "protocol",
+            .size = sizeof(mbuf_userdata_field_proto_t),
+            .align = 8,
+        },
+        [ MBUF_FIELD_ROUTE ] = {
+            .name = "route",
+            .size = sizeof(mbuf_userdata_field_route_t),
+            .align = 8,
+        },
+    };
+
+    for (i = 0; i < NELEMS(rte_mbuf_userdata_fields); i++) {
+        if (rte_mbuf_userdata_fields[i].size == 0)
+            continue;
+        offset = rte_mbuf_dynfield_register(&rte_mbuf_userdata_fields[i]);
+        if (offset < 0) {
+            RTE_LOG(ERR, MBUF, "fail to register dynfield[%d] in mbuf!\n", i);
+            return EDPVS_NOROOM;
+        }
+        mbuf_dynfields_offset[i] = offset;
+    }
+
+    return EDPVS_OK;
+}
+
+uint16_t mbuf_ether_type(struct rte_mbuf *mbuf)
+{
+    // FIXME: The ether-type should be retrived from mbuf->packet_type
+    // in consideration of performance. But the packet_type field of mbuf
+    // is overwitten by DPVS, which is expected to be fixed in dpvs v1.9.
+
+    uint16_t ethtype;
+    struct rte_ether_hdr *ehdr;
+
+    ehdr = mbuf_header_l2(mbuf);
+    if (unlikely(!ehdr))
+        return 0;
+    ethtype = ntohs(ehdr->ether_type);
+    if (unlikely(ethtype == RTE_ETHER_TYPE_VLAN))
+        ethtype = ntohs(*((uint16_t *)(((void *)&ehdr->ether_type) + 4)));
+    return ethtype;
+}
+
+int mbuf_address_family(struct rte_mbuf *mbuf)
+{
+    uint16_t etype = mbuf_ether_type(mbuf);
+
+    if (etype == RTE_ETHER_TYPE_IPV4)
+        return AF_INET;
+    if (etype == RTE_ETHER_TYPE_IPV6)
+        return AF_INET6;
+    return 0;  // AF_UNSPEC
+}
+
+uint8_t mbuf_protocol(struct rte_mbuf *mbuf)
+{
+    // FIXME: The ether-type should be retrived from mbuf->packet_type
+    // in consideration of performance. But the packet_type field of mbuf
+    // is overwitten by DPVS, which is expected to be fixed in dpvs v1.9.
+
+    uint32_t ptype;
+    struct rte_net_hdr_lens hdrlens = { 0 };
+
+    ptype = rte_net_get_ptype(mbuf, &hdrlens, RTE_PTYPE_L2_MASK
+            | RTE_PTYPE_L3_MASK | RTE_PTYPE_L4_MASK);
+    if (!ptype)
+        return 0;
+
+    switch (ptype & RTE_PTYPE_L4_MASK) {
+    case RTE_PTYPE_L4_TCP:
+        return IPPROTO_TCP;
+    case RTE_PTYPE_L4_UDP:
+        return IPPROTO_UDP;
+    case RTE_PTYPE_L4_SCTP:
+        return IPPROTO_SCTP;
+    case RTE_PTYPE_L4_ICMP:
+        return IPPROTO_ICMP;
+#if RTE_VERSION >= RTE_VERSION_NUM(18, 11, 0, 0)
+    case RTE_PTYPE_L4_IGMP:
+        return IPPROTO_IGMP;
+#endif
+    default:
+        return 0;
+    }
+
+    return 0;
+}
+
+void *mbuf_header_l2(struct rte_mbuf *mbuf)
+{
+    uint32_t ptype;
+    struct rte_net_hdr_lens hdrlens = { 0 };
+
+    if (unlikely(!mbuf->l2_len)) {
+        ptype = rte_net_get_ptype(mbuf, &hdrlens, RTE_PTYPE_L2_MASK);
+        if (!ptype)
+            return NULL;
+        mbuf->l2_len = hdrlens.l2_len;
+    }
+
+    return rte_pktmbuf_mtod(mbuf, void *);
+}
+
+void *mbuf_header_l3(struct rte_mbuf *mbuf)
+{
+    uint32_t ptype;
+    struct rte_net_hdr_lens hdrlens = { 0 };
+
+    if (unlikely(!mbuf->l3_len || !mbuf->l2_len)) {
+        ptype = rte_net_get_ptype(mbuf, &hdrlens,
+                RTE_PTYPE_L2_MASK | RTE_PTYPE_L3_MASK);
+        if (!ptype)
+            return NULL;
+        assert(!mbuf->l2_len || mbuf->l2_len == hdrlens.l2_len);
+        mbuf->l2_len = hdrlens.l2_len;
+        mbuf->l3_len = hdrlens.l3_len;
+    }
+
+    return rte_pktmbuf_mtod_offset(mbuf, void *, mbuf->l2_len);
+}
+
+void *mbuf_header_l4(struct rte_mbuf *mbuf)
+{
+    uint32_t ptype;
+    struct rte_net_hdr_lens hdrlens = { 0 };
+
+    if (unlikely(!mbuf->l4_len || !mbuf->l3_len || !mbuf->l2_len)) {
+        ptype = rte_net_get_ptype(mbuf, &hdrlens, RTE_PTYPE_L2_MASK
+                | RTE_PTYPE_L3_MASK | RTE_PTYPE_L4_MASK);
+        if (!ptype)
+            return NULL;
+        assert((!mbuf->l2_len || mbuf->l2_len == hdrlens.l2_len)
+                && (!mbuf->l3_len || mbuf->l3_len == hdrlens.l3_len));
+        mbuf->l2_len = hdrlens.l2_len;
+        mbuf->l3_len = hdrlens.l3_len;
+        mbuf->l4_len = hdrlens.l4_len;
+    }
+
+    return rte_pktmbuf_mtod_offset(mbuf, void *, mbuf->l2_len + mbuf->l3_len);
+}

@@ -237,11 +237,12 @@ static int gre_dev_init(struct netif_port *dev)
 }
 
 static struct netif_ops gre_dev_ops = {
-    .op_init        = gre_dev_init,
-    .op_xmit        = gre_xmit,
-    .op_get_link    = ip_tunnel_get_link,
-    .op_get_stats   = ip_tunnel_get_stats,
-    .op_get_promisc = ip_tunnel_get_promisc,
+    .op_init             = gre_dev_init,
+    .op_xmit             = gre_xmit,
+    .op_get_link         = ip_tunnel_get_link,
+    .op_get_stats        = ip_tunnel_get_stats,
+    .op_get_promisc      = ip_tunnel_get_promisc,
+    .op_get_allmulticast = ip_tunnel_get_allmulticast,
 };
 
 static void gre_setup(struct netif_port *dev)
@@ -271,7 +272,7 @@ static int gre_rcv(struct rte_mbuf *mbuf)
     if (hlen < 0)
         goto drop;
 
-    iph = mbuf->userdata; /* see ipv4_local_in_fin */
+    iph = MBUF_USERDATA(mbuf, struct iphdr *, MBUF_FIELD_PROTO); /* see ipv4_local_in_fin */
     assert(iph->version == 4 && iph->protocol == IPPROTO_GRE);
 
     tnl = ip_tunnel_lookup(&gre_tunnel_tab, mbuf->port, tpi.flags,

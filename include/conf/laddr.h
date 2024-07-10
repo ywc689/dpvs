@@ -24,6 +24,7 @@
 
 #include "inet.h"
 #include "net/if.h"
+#include "conf/match.h"
 #include "conf/sockopts.h"
 
 struct dp_vs_laddr_entry {
@@ -33,18 +34,17 @@ struct dp_vs_laddr_entry {
     uint32_t    nconns;
 };
 
-struct dp_vs_laddr_conf {
+typedef struct dp_vs_laddr_conf {
     /* identify service */
     int                 af_s;
     uint8_t             proto;
     union inet_addr     vaddr;
     uint16_t            vport;
     uint32_t            fwmark;
-    char                srange[256];
-    char                drange[256];
-    char                iifname[IFNAMSIZ];
-    char                oifname[IFNAMSIZ];
+
+    struct dp_vs_match match;
     lcoreid_t           cid;
+    lcoreid_t           index;
 
     /* for set */
     int                 af_l;
@@ -54,6 +54,28 @@ struct dp_vs_laddr_conf {
     /* for get */
     int                 nladdrs;
     struct dp_vs_laddr_entry laddrs[0];
-};
+} dpvs_laddr_table_t;
+
+#ifdef CONFIG_DPVS_AGENT
+typedef struct dp_vs_laddr_detail {
+    uint32_t af;
+    uint32_t conns;
+    uint64_t nport_conflict;
+    union inet_addr addr;
+    char ifname[IFNAMSIZ];
+} dpvs_laddr_detail_t;
+
+typedef struct dp_vs_laddr_front {
+    uint32_t af;
+    uint32_t port;
+    uint32_t proto;
+    uint32_t fwmark;
+    uint32_t cid;
+    uint32_t count;
+    union inet_addr addr;
+    struct dp_vs_match match;
+    struct dp_vs_laddr_detail laddrs[0];
+} dpvs_laddr_front_t;
+#endif /* CONFIG_DPVS_AGENT */
 
 #endif /* __DPVS_LADDR_CONF_H__ */

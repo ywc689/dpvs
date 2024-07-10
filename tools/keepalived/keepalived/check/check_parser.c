@@ -957,6 +957,13 @@ expire_quiescent_handler(const vector_t *strvec)
 }
 
 static void
+quic_handler(const vector_t *strvec)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	vs->quic = true;
+}
+
+static void
 bind_dev_handler(const vector_t *strvec)
 {
 	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
@@ -978,10 +985,27 @@ blklst_gname_handler(const vector_t *strvec)
 	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
 	vs->blklst_addr_gname = set_value(strvec);
 }
+static void
+whtlst_group_handler(const vector_t *strvec)
+{
+	if (!strvec)
+	    return;
+    alloc_whtlst_group(vector_slot(strvec, 1));
+    alloc_value_block(alloc_whtlst_entry, strvec_slot(strvec, 0));
+}
+static void
+whtlst_gname_handler(const vector_t *strvec)
+{
+    virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+    vs->whtlst_addr_gname = set_value(strvec);
+}
 
 static void
 tunnel_handler(const vector_t *strvec)
 {
+	if (!strvec)
+		return;
+
 	alloc_tunnel(vector_slot(strvec, 1));
 }
 
@@ -1039,8 +1063,8 @@ static void
 limit_proportion_handler(const vector_t *strvec)
 {
 	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
-    char *str = vector_slot(strvec, 1); 
-    vs->limit_proportion = atoi(str);
+	char *str = vector_slot(strvec, 1);
+	vs->limit_proportion = atoi(str);
 }
 
 static void
@@ -1054,6 +1078,13 @@ establish_timeout_handler(const vector_t *strvec)
 	if (conn_timeout < ESTABLISH_TIMEOUT_MIN)
 		conn_timeout = ESTABLISH_TIMEOUT_MIN;
 	vs->conn_timeout = conn_timeout;
+}
+
+static void
+proxy_protocol_handler(const vector_t *strvec)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	vs->proxy_protocol = proxy_protocol_type((const char *)vector_slot(strvec, 1));
 }
 
 static void
@@ -1124,6 +1155,8 @@ init_check_keywords(bool active)
 	install_keyword_root("local_address_group", &laddr_group_handler, active);
 	/* blacklist IP */
 	install_keyword_root("deny_address_group", &blklst_group_handler, active);
+	/* whitelist IP */
+	install_keyword_root("allow_address_group", &whtlst_group_handler, active);
 
 	/* Virtual server mapping */
 	install_keyword_root("virtual_server_group", &vsg_handler, active);
@@ -1154,6 +1187,7 @@ init_check_keywords(bool active)
 #endif
 	install_keyword("lb_kind", &forwarding_handler);
 	install_keyword("establish_timeout", &establish_timeout_handler);
+	install_keyword("proxy_protocol", &proxy_protocol_handler);
 	install_keyword("lvs_method", &forwarding_handler);
 #ifdef _HAVE_PE_NAME_
 	install_keyword("persistence_engine", &pengine_handler);
@@ -1210,8 +1244,10 @@ init_check_keywords(bool active)
 	install_sublevel_end();
 	install_keyword("laddr_group_name", &laddr_gname_handler);
 	install_keyword("daddr_group_name", &blklst_gname_handler);
+	install_keyword("waddr_group_name", &whtlst_gname_handler);
 	install_keyword("syn_proxy", &syn_proxy_handler);
 	install_keyword("expire_quiescent_conn", &expire_quiescent_handler);
+	install_keyword("quic", &quic_handler);
 	install_keyword("vip_bind_dev", &bind_dev_handler);
 }
 

@@ -26,10 +26,13 @@
 #include "ipvs/ipvs.h"
 #include "ipvs/proto.h"
 #include "ipvs/proto_udp.h"
+#include "ipvs/quic.h"
 #include "ipvs/conn.h"
 #include "ipvs/service.h"
 #include "ipvs/blklst.h"
+#include "ipvs/whtlst.h"
 #include "ipvs/redirect.h"
+#include "ipvs/proxy_proto.h"
 #include "parser/parser.h"
 #include "uoa.h"
 #include "neigh.h"
@@ -58,57 +61,60 @@ static int g_uoa_mode = UOA_M_OPP; /* by default */
 int g_defence_udp_drop = 0;
 
 static int udp_timeouts[DPVS_UDP_S_LAST + 1] = {
+    [DPVS_UDP_S_NONE]   = 2,
+    [DPVS_UDP_S_ONEWAY] = 300,
     [DPVS_UDP_S_NORMAL] = 300,
     [DPVS_UDP_S_LAST]   = 2,
 };
 
-inline void udp4_send_csum(struct ipv4_hdr *iph, struct udp_hdr *uh)
+inline void udp4_send_csum(struct rte_ipv4_hdr *iph, struct rte_udp_hdr *uh)
 {
     uh->dgram_cksum = 0;
-    uh->dgram_cksum = ip4_udptcp_cksum(iph, uh);
+    uh->dgram_cksum = rte_ipv4_udptcp_cksum(iph, uh);
 }
 
-inline void udp6_send_csum(struct ipv6_hdr *iph, struct udp_hdr *uh)
+inline void udp6_send_csum(struct rte_ipv6_hdr *iph, struct rte_udp_hdr *uh)
 {
     uh->dgram_cksum = 0;
     uh->dgram_cksum = ip6_udptcp_cksum((struct ip6_hdr *)iph, (struct udphdr *)uh,
             (void *)uh - (void *)iph, IPPROTO_UDP);
 }
 
-static inline int udp_send_csum(int af, int iphdrlen, struct udp_hdr *uh,
-                                const struct dp_vs_conn *conn,
-                                struct rte_mbuf *mbuf, const struct opphdr *opp)
+int udp_send_csum(int af, int iphdrlen, struct rte_udp_hdr *uh,
+        const struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
+        const struct opphdr *opp, struct netif_port *dev)
 {
     /* leverage HW TX UDP csum offload if possible */
-
-    struct netif_port *dev = NULL;
+    struct netif_port *select_dev = NULL;
 
     if (AF_INET6 == af) {
         /* UDP checksum is mandatory for IPv6.[RFC 2460] */
         struct ip6_hdr *ip6h = ip6_hdr(mbuf);
         if (unlikely(opp != NULL)) {
-            udp6_send_csum((struct ipv6_hdr*)ip6h, uh);
+            udp6_send_csum((struct rte_ipv6_hdr*)ip6h, uh);
         } else {
-            struct route6 *rt6 = mbuf->userdata;
+            struct route6 *rt6 = MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE);
             if (rt6 && rt6->rt6_dev)
-                dev = rt6->rt6_dev;
+                select_dev = rt6->rt6_dev;
+            else if (dev)
+                select_dev = dev;
             else if (conn->out_dev)
-                dev = conn->out_dev;
-            if (likely(dev && (dev->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD))) {
+                select_dev = conn->out_dev;
+            if (likely(select_dev && (select_dev->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD))) {
                 mbuf->l3_len = iphdrlen;
-                mbuf->l4_len = ntohs(ip6h->ip6_plen) + sizeof(struct ip6_hdr) -iphdrlen;
+                mbuf->l4_len = sizeof(struct rte_udp_hdr);
                 mbuf->ol_flags |= (PKT_TX_UDP_CKSUM | PKT_TX_IPV6);
                 uh->dgram_cksum = ip6_phdr_cksum(ip6h, mbuf->ol_flags,
                         iphdrlen, IPPROTO_UDP);
             } else {
                 if (mbuf_may_pull(mbuf, mbuf->pkt_len) != 0)
                     return EDPVS_INVPKT;
-                udp6_send_csum((struct ipv6_hdr*)ip6h, uh);
+                udp6_send_csum((struct rte_ipv6_hdr*)ip6h, uh);
             }
         }
     } else { /* AF_INET */
         /* UDP checksum is not mandatory for IPv4. */
-        struct ipv4_hdr *iph = ip4_hdr(mbuf);
+        struct rte_ipv4_hdr *iph = ip4_hdr(mbuf);
         if (unlikely(opp != NULL)) {
             /*
              * XXX: UDP pseudo header need UDP length, but the common helper function
@@ -122,16 +128,18 @@ static inline int udp_send_csum(int af, int iphdrlen, struct udp_hdr *uh,
              */
             uh->dgram_cksum = 0;
         } else {
-            struct route_entry *rt = mbuf->userdata;
+            struct route_entry *rt = MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE);
             if (rt && rt->port)
-                dev = rt->port;
+                select_dev = rt->port;
+            else if (dev)
+                select_dev = dev;
             else if (conn->out_dev)
-                dev = conn->out_dev;
-            if (likely(dev && (dev->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD))) {
+                select_dev = conn->out_dev;
+            if (likely(select_dev && (select_dev->flag & NETIF_PORT_FLAG_TX_UDP_CSUM_OFFLOAD))) {
                 mbuf->l3_len = iphdrlen;
-                mbuf->l4_len = ntohs(iph->total_length) - iphdrlen;
+                mbuf->l4_len = sizeof(struct rte_udp_hdr);
                 mbuf->ol_flags |= (PKT_TX_UDP_CKSUM | PKT_TX_IP_CKSUM | PKT_TX_IPV4);
-                uh->dgram_cksum = ip4_phdr_cksum(iph, mbuf->ol_flags);
+                uh->dgram_cksum = rte_ipv4_phdr_cksum(iph, mbuf->ol_flags);
             } else {
                 if (mbuf_may_pull(mbuf, mbuf->pkt_len) != 0)
                     return EDPVS_INVPKT;
@@ -148,9 +156,8 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
                         struct dp_vs_conn **conn,
                         int *verdict)
 {
-    struct udp_hdr *uh, _udph;
+    struct rte_udp_hdr *uh, _udph;
     struct dp_vs_service *svc;
-    bool outwall = false;
     assert(proto && iph && mbuf && conn && verdict);
 
     uh = mbuf_header_pointer(mbuf, iph->len, sizeof(_udph), &_udph);
@@ -160,18 +167,40 @@ static int udp_conn_sched(struct dp_vs_proto *proto,
     }
 
     /* lookup service <vip:vport> */
-    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr, 
-                     uh->dst_port, 0, mbuf, NULL, &outwall, rte_lcore_id());
+    svc = dp_vs_service_lookup(iph->af, iph->proto, &iph->daddr,
+                     uh->dst_port, 0, mbuf, NULL, rte_lcore_id());
     if (!svc) {
         *verdict = INET_ACCEPT;
         return EDPVS_NOSERV;
     }
 
     /* schedule RS and create new connection */
-    *conn = dp_vs_schedule(svc, iph, mbuf, false, outwall);
+    *conn = NULL;
+    if (svc->flags & DP_VS_SVC_F_QUIC) { // deal with quic conn migration
+        struct quic_server qsvr = { 0 };
+        int err = quic_parse_server(mbuf, iph, &qsvr);
+        if (likely(err == EDPVS_OK)) {
+            if (qsvr.wildcard > 0) {
+                *conn = quic_schedule(svc, &qsvr, iph, mbuf);
+                if (*conn)
+                    RTE_LOG(INFO, IPVS, "schedule new connection from quic cid\n");
+                else {
+                    // Do NOT emit warning log here!
+                    // The DCID in Initial packets are generated randomly by client, which
+                    // doesn't contain valid server address info for success schedule.
+                }
+            }
+        } else {
+            RTE_LOG(WARNING, IPVS, "fail to parse server info from quic mbuf: %s\n",
+                    dpvs_strerror(err));
+        }
+    }
     if (!*conn) {
-        *verdict = INET_DROP;
-        return EDPVS_RESOURCE;
+        *conn = dp_vs_schedule(svc, iph, mbuf, false);
+        if (!*conn) {
+            *verdict = INET_DROP;
+            return EDPVS_RESOURCE;
+        }
     }
 
     if ((*conn)->dest->fwdmode == DPVS_FWD_MODE_FNAT && g_uoa_max_trail > 0) {
@@ -198,7 +227,7 @@ udp_conn_lookup(struct dp_vs_proto *proto,
                 struct rte_mbuf *mbuf, int *direct,
                 bool reverse, bool *drop, lcoreid_t *peer_cid)
 {
-    struct udp_hdr *uh, _udph;
+    struct rte_udp_hdr *uh, _udph;
     struct dp_vs_conn *conn;
     assert(proto && iph && mbuf);
 
@@ -208,6 +237,12 @@ udp_conn_lookup(struct dp_vs_proto *proto,
 
     if (dp_vs_blklst_lookup(iph->af, iph->proto, &iph->daddr,
                 uh->dst_port, &iph->saddr)) {
+        *drop = true;
+        return NULL;
+    }
+
+    if (!dp_vs_whtlst_allow(iph->af, iph->proto, &iph->daddr,
+							uh->dst_port, &iph->saddr)) {
         *drop = true;
         return NULL;
     }
@@ -243,6 +278,14 @@ udp_conn_lookup(struct dp_vs_proto *proto,
 
 static int udp_conn_expire(struct dp_vs_proto *proto, struct dp_vs_conn *conn)
 {
+    // Note: udp dest-check works only when the udp is bidirectional, that is,
+    //   the udp conns that forwarding inbound only or outbound only are always
+    //   detcted dead. Thus "dest-check" should be never configured for the
+    //   single directional udp flow. Besides, the a smaller conn timeout may be
+    //   specified for the bidirectional flow service to detect dest fault quickly.
+    if (conn->state == DPVS_UDP_S_ONEWAY)
+        dp_vs_dest_detected_dead(conn->dest);
+
     if (conn->prot_data)
         rte_free(conn->prot_data);
 
@@ -259,8 +302,24 @@ static int udp_conn_expire_quiescent(struct dp_vs_conn *conn)
 static int udp_state_trans(struct dp_vs_proto *proto, struct dp_vs_conn *conn,
                            struct rte_mbuf *mbuf, int dir)
 {
-    conn->state = DPVS_UDP_S_NORMAL;
+    int old_state = conn->state;
+
+    if (conn->dest->fwdmode == DPVS_FWD_MODE_SNAT) {
+        if (dir == DPVS_CONN_DIR_INBOUND)
+            conn->state = DPVS_UDP_S_NORMAL;
+        else if (conn->state == DPVS_UDP_S_NONE)
+            conn->state = DPVS_UDP_S_ONEWAY;
+    } else {
+        if (dir == DPVS_CONN_DIR_OUTBOUND)
+            conn->state = DPVS_UDP_S_NORMAL;
+        else if (conn->state == DPVS_UDP_S_NONE)
+            conn->state = DPVS_UDP_S_ONEWAY;
+    }
     dp_vs_conn_set_timeout(conn, proto);
+
+    if (old_state == DPVS_UDP_S_ONEWAY && conn->state == DPVS_UDP_S_NORMAL)
+        dp_vs_dest_detected_alive(conn->dest);
+
     return EDPVS_OK;
 }
 
@@ -278,7 +337,8 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     int iaf = tuplehash_in(conn).af;
     int oaf = tuplehash_out(conn).af;
 
-    assert(conn && ombuf && oiph && ouh && ombuf->userdata);
+    assert(conn && ombuf && oiph && ouh &&
+            MBUF_USERDATA_CONST(ombuf, void *, MBUF_FIELD_ROUTE));
 
     /* just in case */
     if (unlikely(conn->dest->fwdmode != DPVS_FWD_MODE_FNAT))
@@ -287,7 +347,7 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
     mbuf = rte_pktmbuf_alloc(ombuf->pool);
     if (unlikely(!mbuf))
         return EDPVS_NOMEM;
-    mbuf->userdata = NULL;
+    MBUF_USERDATA(mbuf, void *, MBUF_FIELD_ROUTE) = NULL;
 
     int ipolen_uoa = (AF_INET6 == iaf) ? IPOLEN_UOA_IPV6 : IPOLEN_UOA_IPV4;
 
@@ -308,7 +368,7 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
             goto no_room;
         ((struct iphdr *)iph)->version = 4;
         ((struct iphdr *)iph)->tos     = ((struct iphdr *)oiph)->tos;
-        ((struct iphdr *)iph)->id      = ip4_select_id((struct ipv4_hdr *)iph);
+        ((struct iphdr *)iph)->id      = ip4_select_id((struct rte_ipv4_hdr *)iph);
         ((struct iphdr *)iph)->frag_off = 0;
         ((struct iphdr *)iph)->ttl     = ((struct iphdr *)oiph)->ttl;
         ((struct iphdr *)iph)->saddr   = conn->laddr.in.s_addr;
@@ -390,14 +450,16 @@ static int send_standalone_uoa(const struct dp_vs_conn *conn,
          * if udp checksum error here, may cause tcpdump & uoa moudule parse packets
          * correctly, however socket can not receive L4 data.
          */
-        udp6_send_csum((struct ipv6_hdr *)iph, (struct udp_hdr*)uh);
-        mbuf->userdata = rt6 = (struct route6*)ombuf->userdata;
+        udp6_send_csum((struct rte_ipv6_hdr *)iph, (struct rte_udp_hdr*)uh);
+        rt6 = MBUF_USERDATA_CONST(ombuf, struct route6 *, MBUF_FIELD_ROUTE);
+        MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE) = rt6;
         route6_get(rt6);
         return ip6_local_out(mbuf);
     } else { /* IPv4 */
         struct route_entry *rt;
         uh->check  = 0; /* rte_ipv4_udptcp_cksum fails if opp inserted. */
-        mbuf->userdata = rt = (struct route_entry *)ombuf->userdata;
+        rt = MBUF_USERDATA_CONST(ombuf, struct route_entry *, MBUF_FIELD_ROUTE);
+        MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
         route4_get(rt);
         return ipv4_local_out(mbuf);
     }
@@ -415,9 +477,9 @@ static int insert_ipopt_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
     struct ipopt_uoa *optuoa;
 
     assert(AF_INET == tuplehash_in(conn).af && AF_INET == tuplehash_out(conn).af);
-    if ((ip4_hdrlen(mbuf) + sizeof(struct ipopt_uoa) >
+    if ((ip4_hdrlen(mbuf) + IPOLEN_UOA_IPV4 >
                 sizeof(struct iphdr) + MAX_IPOPTLEN)
-            || (mbuf->pkt_len + sizeof(struct ipopt_uoa) > mtu))
+            || (mbuf->pkt_len + IPOLEN_UOA_IPV4 > mtu))
         goto standalone_uoa;
 
     /*
@@ -494,7 +556,7 @@ static int insert_opp_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
          *   basic header length (40 B) + payload length(including ext header)
          */
         iphdrlen   = ip6_hdrlen(mbuf);
-        if (iphdrlen != sizeof(struct ipv6_hdr))
+        if (iphdrlen != sizeof(struct rte_ipv6_hdr))
             goto standalone_uoa;
         iptot_len  = sizeof(struct ip6_hdr) +
                      ntohs(((struct ip6_hdr *)iph)->ip6_plen);
@@ -611,7 +673,7 @@ static int udp_insert_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
         return EDPVS_OK;
     }
 
-    rt = mbuf->userdata;
+    rt = MBUF_USERDATA(mbuf, void *, MBUF_FIELD_ROUTE);
     if (!rt) {
         RTE_LOG(ERR, IPVS, "%s: no route\n", __func__);
         return EDPVS_INVPKT;
@@ -619,10 +681,14 @@ static int udp_insert_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
 
     if (AF_INET6 == tuplehash_out(conn).af) {
         mtu = ((struct route6*)rt)->rt6_mtu;
+    } else {
+        mtu = ((struct route_entry*) rt)->mtu;
+    }
+
+    if (AF_INET6 == conn->af) {
         iph = ip6_hdr(mbuf);
         iphdrlen = ip6_hdrlen(mbuf);
     } else {
-        mtu = ((struct route_entry*) rt)->mtu;
         iph = (struct iphdr *)ip4_hdr(mbuf);
         iphdrlen = ip4_hdrlen(mbuf);
     }
@@ -666,16 +732,56 @@ static int udp_insert_uoa(struct dp_vs_conn *conn, struct rte_mbuf *mbuf,
     return err;
 }
 
+static int udp_in_add_proxy_proto(struct dp_vs_conn *conn,
+        struct rte_mbuf *mbuf, struct rte_udp_hdr *udph,
+        int iphdrlen, int *hdr_shift)
+{
+    int offset;
+    struct proxy_info ppinfo = { 0 };
+
+    offset = iphdrlen + sizeof(struct rte_udp_hdr);
+    if (unlikely(EDPVS_OK != proxy_proto_parse(mbuf, offset, &ppinfo)))
+        return EDPVS_INVPKT;
+
+    if (ppinfo.datalen > 0
+            && ppinfo.version == PROXY_PROTOCOL_VERSION(conn->pp_version)
+            && PROXY_PROTOCOL_IS_INSECURE(conn->pp_version))
+        return EDPVS_OK;    // keep intact the original proxy protocol data
+
+    if (!ppinfo.datalen || !PROXY_PROTOCOL_IS_INSECURE(conn->pp_version)) {
+        ppinfo.af = tuplehash_in(conn).af;
+        ppinfo.proto = IPPROTO_UDP;
+        ppinfo.version = PROXY_PROTOCOL_VERSION(conn->pp_version);
+        ppinfo.cmd = 1;
+        if (AF_INET == ppinfo.af) {
+            ppinfo.addr.ip4.src_addr = conn->caddr.in.s_addr;
+            ppinfo.addr.ip4.dst_addr = conn->vaddr.in.s_addr;
+            ppinfo.addr.ip4.src_port = conn->cport;
+            ppinfo.addr.ip4.dst_port = conn->vport;
+        } else if (AF_INET6 == ppinfo.af) {
+            rte_memcpy(ppinfo.addr.ip6.src_addr, conn->caddr.in6.s6_addr, 16);
+            rte_memcpy(ppinfo.addr.ip6.dst_addr, conn->vaddr.in6.s6_addr, 16);
+            ppinfo.addr.ip6.src_port = conn->cport;
+            ppinfo.addr.ip6.dst_port = conn->vport;
+        } else {
+            return EDPVS_NOTSUPP;
+        }
+    }
+
+    return proxy_proto_insert(&ppinfo, conn, mbuf, udph, hdr_shift);
+}
+
 static int udp_fnat_in_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh = NULL;
+    struct rte_udp_hdr *uh = NULL;
     struct opphdr *opp = NULL;
     void *iph = NULL;
     /* af/mbuf may be changed for nat64 which in af is ipv6 and out is ipv4 */
     int af = tuplehash_out(conn).af;
-    int iphdrlen = 0;
+    int err, iphdrlen = 0;
+    int hdr_shift = 0;
     uint8_t nxt_proto;
 
     if (AF_INET6 == af) {
@@ -692,45 +798,57 @@ static int udp_fnat_in_handler(struct dp_vs_proto *proto,
     }
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
 
     if (nxt_proto == IPPROTO_UDP) {
-        uh = (struct udp_hdr *)(iph + iphdrlen);
+        uh = (struct rte_udp_hdr *)(iph + iphdrlen);
     } else if (nxt_proto == IPPROTO_OPT) {
         opp = (struct opphdr *)(iph + iphdrlen);
-        uh  = (struct udp_hdr *)((void *)opp + ntohs(opp->length));
+        uh  = (struct rte_udp_hdr *)((void *)opp + ntohs(opp->length));
     }
 
     if (unlikely(!uh))
         return EDPVS_INVPKT;
 
+    if (!conn->pp_sent &&
+            (PROXY_PROTOCOL_V2 == PROXY_PROTOCOL_VERSION(conn->pp_version))) {
+        err = udp_in_add_proxy_proto(conn, mbuf, uh, iphdrlen, &hdr_shift);
+        if (unlikely(EDPVS_OK != err))
+            RTE_LOG(INFO, IPVS, "%s: insert proxy protocol fail -- %s\n",
+                    __func__, dpvs_strerror(err));
+        // Notes: Is there any approach to deal with the exceptional cases where
+        //   - proxy protocol insertion failed
+        //   - the first udp packet with proxy protocol data got lost in network
+        conn->pp_sent = 1;
+        uh = ((void *)uh) + hdr_shift;
+    }
     uh->src_port = conn->lport;
     uh->dst_port = conn->dport;
 
-    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, opp);
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, opp, conn->in_dev);
 }
 
 static int udp_fnat_out_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh;
+    struct rte_udp_hdr *uh;
     /* af/mbuf may be changed for nat64 which in af is ipv6 and out is ipv4 */
     int af = tuplehash_in(conn).af;
     int iphdrlen = ((AF_INET6 == af) ? ip6_hdrlen(mbuf): ip4_hdrlen(mbuf));
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
-    uh = rte_pktmbuf_mtod_offset(mbuf, struct udp_hdr *, iphdrlen);
+    uh = rte_pktmbuf_mtod_offset(mbuf, struct rte_udp_hdr *, iphdrlen);
     if (unlikely(!uh))
         return EDPVS_INVPKT;
 
     uh->src_port = conn->vport;
     uh->dst_port = conn->cport;
 
-    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL);
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL, conn->out_dev);
 }
 
 static int udp_fnat_in_pre_handler(struct dp_vs_proto *proto,
@@ -739,50 +857,53 @@ static int udp_fnat_in_pre_handler(struct dp_vs_proto *proto,
 {
     struct conn_uoa *uoa = (struct conn_uoa *)conn->prot_data;
 
+    if (PROXY_PROTOCOL_V2 == PROXY_PROTOCOL_VERSION(conn->pp_version))
+        return EDPVS_OK;
+
     if (uoa && g_uoa_max_trail > 0)
         return udp_insert_uoa(conn, mbuf, uoa);
-    else
-        return EDPVS_OK;
+
+    return EDPVS_OK;
 }
 
 static int udp_snat_in_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh;
+    struct rte_udp_hdr *uh;
     int af = conn->af;
     int iphdrlen = ((AF_INET6 == af) ? ip6_hdrlen(mbuf): ip4_hdrlen(mbuf));
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
-    uh = rte_pktmbuf_mtod_offset(mbuf, struct udp_hdr *, iphdrlen);
+    uh = rte_pktmbuf_mtod_offset(mbuf, struct rte_udp_hdr *, iphdrlen);
     if (unlikely(!uh))
         return EDPVS_INVPKT;
 
     uh->dst_port = conn->dport;
 
-    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL);
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL, conn->in_dev);
 }
 
 static int udp_snat_out_handler(struct dp_vs_proto *proto,
                     struct dp_vs_conn *conn,
                     struct rte_mbuf *mbuf)
 {
-    struct udp_hdr *uh;
+    struct rte_udp_hdr *uh;
     int af = conn->af;
     int iphdrlen = ((AF_INET6 == af) ? ip6_hdrlen(mbuf): ip4_hdrlen(mbuf));
 
     /* cannot use mbuf_header_pointer() */
-    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct udp_hdr)))
+    if (unlikely(mbuf->data_len < iphdrlen + sizeof(struct rte_udp_hdr)))
         return EDPVS_INVPKT;
-    uh = rte_pktmbuf_mtod_offset(mbuf, struct udp_hdr *, iphdrlen);
+    uh = rte_pktmbuf_mtod_offset(mbuf, struct rte_udp_hdr *, iphdrlen);
     if (unlikely(!uh))
         return EDPVS_INVPKT;
 
     uh->src_port = conn->vport;
 
-    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL);
+    return udp_send_csum(af, iphdrlen, uh, conn, mbuf, NULL, conn->out_dev);
 }
 
 struct dp_vs_proto dp_vs_proto_udp = {
@@ -843,6 +964,25 @@ static void uoa_mode_handler(vector_t tokens)
     FREE_PTR(str);
 }
 
+static void timeout_oneway_handler(vector_t tokens)
+{
+    int timeout;
+    char *str = set_value(tokens);
+
+    assert(str);
+    timeout = atoi(str);
+    if (timeout > IPVS_TIMEOUT_MIN && timeout < IPVS_TIMEOUT_MAX) {
+        RTE_LOG(INFO, IPVS, "udp_timeout_oneway = %d\n", timeout);
+        udp_timeouts[DPVS_UDP_S_ONEWAY] = timeout;
+    } else {
+        RTE_LOG(INFO, IPVS, "invalid udp_timeout_oneway %s, using default %d\n",
+                str, 300);
+        udp_timeouts[DPVS_UDP_S_ONEWAY] = 300;
+    }
+
+    FREE_PTR(str);
+}
+
 static void timeout_normal_handler(vector_t tokens)
 {
     int timeout;
@@ -891,6 +1031,7 @@ void udp_keyword_value_init(void)
     g_defence_udp_drop = 0;
     g_uoa_max_trail = UOA_DEF_MAX_TRAIL;
 
+    udp_timeouts[DPVS_UDP_S_ONEWAY] = 300;
     udp_timeouts[DPVS_UDP_S_NORMAL] = 300;
     udp_timeouts[DPVS_UDP_S_LAST] = 2;
 }
@@ -904,6 +1045,7 @@ void install_proto_udp_keywords(void)
     install_keyword("timeout", NULL, KW_TYPE_NORMAL);
     install_sublevel();
     install_keyword("normal", timeout_normal_handler, KW_TYPE_NORMAL);
+    install_keyword("oneway", timeout_oneway_handler, KW_TYPE_NORMAL);
     install_keyword("last", timeout_last_handler, KW_TYPE_NORMAL);
     install_sublevel_end();
 }

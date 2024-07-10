@@ -24,6 +24,7 @@
 #define __DPVS_TC_CLS_H__
 #include "conf/common.h"
 #include "conf/match.h"
+#include "conf/ipset.h"
 #ifdef __DPVS__
 #include "dpdk.h"
 #endif /* __DPVS__ */
@@ -36,6 +37,12 @@ struct tc_cls_result {
 struct tc_cls_match_copt {
     uint8_t                 proto;      /* IPPROTO_XXX */
     struct dp_vs_match      match;
+    struct tc_cls_result    result;
+} __attribute__((__packed__));
+
+struct tc_cls_ipset_copt {
+    char                    setname[IPSET_MAXNAMELEN];
+    bool                    dst_match;
     struct tc_cls_result    result;
 } __attribute__((__packed__));
 
@@ -57,7 +64,6 @@ struct tc_cls_ops {
     int                     (*dump)(struct tc_cls *cls, void *arg);
 
     struct list_head        list;
-    rte_atomic32_t          refcnt;
 };
 
 /* classifier */
@@ -85,6 +91,8 @@ void tc_cls_destroy(struct tc_cls *cls);
 int tc_cls_change(struct tc_cls *cls, const void *arg);
 
 struct tc_cls *tc_cls_lookup(struct Qsch *sch, tc_handle_t handle);
+
+tc_handle_t cls_alloc_handle(struct Qsch *sch);
 
 #endif /* __DPVS__ */
 

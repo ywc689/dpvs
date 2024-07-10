@@ -46,10 +46,11 @@ static int ipip_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
 }
 
 static struct netif_ops ipip_dev_ops = {
-    .op_xmit        = ipip_xmit,
-    .op_get_link    = ip_tunnel_get_link,
-    .op_get_stats   = ip_tunnel_get_stats,
-    .op_get_promisc = ip_tunnel_get_promisc,
+    .op_xmit             = ipip_xmit,
+    .op_get_link         = ip_tunnel_get_link,
+    .op_get_stats        = ip_tunnel_get_stats,
+    .op_get_promisc      = ip_tunnel_get_promisc,
+    .op_get_allmulticast = ip_tunnel_get_allmulticast,
 };
 
 /* dummy packet info for ipip tunnel. */
@@ -72,7 +73,7 @@ static int ipip_rcv(struct rte_mbuf *mbuf)
 
     /* IPv4's upper layer can use @userdata for IP header,
      * see ipv4_local_in_fin() */
-    iph = mbuf->userdata;
+    iph = MBUF_USERDATA(mbuf, struct iphdr *, MBUF_FIELD_PROTO);
     assert(iph->version == 4 && iph->protocol == IPPROTO_IPIP);
 
     tnl = ip_tunnel_lookup(&ipip_tunnel_tab, mbuf->port, TUNNEL_F_NO_KEY,

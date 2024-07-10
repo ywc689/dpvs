@@ -46,6 +46,16 @@
 /* Daemon dynamic data structure definition */
 #define KEEPALIVED_DEFAULT_DELAY	(60 * TIMER_HZ)
 #define TNLKINDSIZ 			16
+
+#define PROXY_PROTOCOL_CHECK_V1	"PROXY UNKNOWN\r\n"
+static const char PROXY_PROTOCOL_CHECK_V2[] = {
+	0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51,
+	0x55, 0x49, 0x54, 0x0A, 0x20, 0x00, 0x00, 0x00,
+};
+#define PROXY_PROTOCOL_CHECK_V1_LEN		15
+#define PROXY_PROTOCOL_CHECK_V2_LEN		16
+#define PROXY_PROTOCOL_CHECK_MAX_LEN		16
+
 /* SSL specific data */
 typedef struct _ssl_data {
 	int				enable;
@@ -131,6 +141,18 @@ typedef struct _blklst_addr_group {
 	list range;
 } blklst_addr_group;
 
+/* whitelist ip group*/
+typedef struct _whtlst_addr_entry {
+    struct sockaddr_storage addr;
+    uint32_t range;
+} whtlst_addr_entry;
+
+typedef struct _whtlst_addr_group {
+    char *gname;
+    list addr_ip;
+    list range;
+} whtlst_addr_group;
+
 typedef struct _tunnel_entry {
 	struct sockaddr_storage remote;
 	struct sockaddr_storage local;
@@ -179,7 +201,8 @@ typedef struct _virtual_server {
 	uint32_t			vfwmark;
 	real_server_t			*s_svr;
 	uint16_t			af;
-	uint16_t			service_type;
+	uint8_t				service_type;
+	uint8_t				proxy_protocol;
 	bool				ha_suspend;
 	int				ha_suspend_addr_count;
 #ifdef _WITH_LVS_
@@ -213,6 +236,7 @@ typedef struct _virtual_server {
 							 * the service from IPVS topology. */
 	bool				syn_proxy;
 	bool				expire_quiescent_conn;
+	bool				quic;
 	unsigned int			connection_to;	/* connection time-out */
 	unsigned long			delay_loop;	/* Interval between running checker */
 	unsigned long			warmup;		/* max random timeout to start checker */
@@ -237,6 +261,7 @@ typedef struct _virtual_server {
 	unsigned hash_target;
 	char 	*local_addr_gname; 	/*local ip address group name*/
 	char 	*blklst_addr_gname; 	/*black list ip group name*/	
+	char 	*whtlst_addr_gname; 	/*white list ip group name*/	
 	char 	*vip_bind_dev; 		/*the interface name, vip bindto*/
 } virtual_server_t;
 
@@ -253,6 +278,7 @@ typedef struct _check_data {
 	unsigned			num_smtp_alert;
 	list laddr_group;
 	list blklst_group;
+	list whtlst_group;
 	list tunnel_group;
 } check_data_t;
 
@@ -284,10 +310,12 @@ static inline bool quorum_equal(const notify_script_t *quorum1,
 #define VS_ISEQ(X,Y)    (sockstorage_equal(&(X)->addr,&(Y)->addr)                       &&\
                          (X)->vfwmark                 == (Y)->vfwmark                   &&\
                          (X)->service_type            == (Y)->service_type              &&\
+                         (X)->proxy_protocol          == (Y)->proxy_protocol            &&\
                          (X)->forwarding_method       == (Y)->forwarding_method         &&\
                          (X)->hash_target             == (Y)->hash_target               &&\
                          (X)->syn_proxy               == (Y)->syn_proxy                 &&\
                          (X)->expire_quiescent_conn   == (Y)->expire_quiescent_conn     &&\
+                         (X)->quic                    == (Y)->quic                      &&\
                          quorum_equal((X)->notify_quorum_up, (Y)->notify_quorum_up)     &&\
                          quorum_equal((X)->notify_quorum_down, (Y)->notify_quorum_down) &&\
                          !strcmp((X)->sched, (Y)->sched)                                &&\
@@ -348,6 +376,9 @@ extern void set_rsgroup(char *);
 extern void dump_check_data(FILE *, check_data_t *);
 extern void alloc_blklst_group(char *);
 extern void alloc_blklst_entry(const vector_t *);
+extern void alloc_whtlst_group(char *);
+extern void alloc_whtlst_entry(const vector_t *);
+
 
 extern void alloc_tunnel_entry(char *name);
 extern void alloc_tunnel(char *gname);

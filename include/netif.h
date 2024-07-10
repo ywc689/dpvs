@@ -18,12 +18,15 @@
 #ifndef __DPVS_NETIF_H__
 #define __DPVS_NETIF_H__
 #include <net/if.h>
+#include <net/ethernet.h>
 #include "list.h"
 #include "dpdk.h"
 #include "inetaddr.h"
+#include "netif_addr.h"
 #include "global_data.h"
 #include "timer.h"
 #include "tc/tc.h"
+#include "conf/netif.h"
 
 #define RTE_LOGTYPE_NETIF RTE_LOGTYPE_USER1
 
@@ -61,6 +64,10 @@ enum {
 #define NETIF_MAX_KNI               64
 /* maximum number of DPDK rte device */
 #define NETIF_MAX_RTE_PORTS         64
+
+#define NETIF_MAX_ETH_MTU           9000
+#define NETIF_DEFAULT_ETH_MTU       1500
+
 
 #define NETIF_ALIGN                 32
 
@@ -162,12 +169,13 @@ typedef enum {
 } port_type_t;
 
 struct netif_kni {
-    char name[IFNAMSIZ];
-    struct rte_kni *kni;
-    struct ether_addr addr;
-    struct dpvs_timer kni_rtnl_timer;
-    int kni_rtnl_fd;
-    struct rte_ring *rx_ring;
+    char                    name[IFNAMSIZ];
+    struct rte_kni          *kni;
+    struct rte_ether_addr   addr;
+    struct dpvs_timer       kni_rtnl_timer;
+    int                     kni_rtnl_fd;
+    struct rte_ring         *rx_ring;
+    struct list_head        kni_flows;
 } __rte_cache_aligned;
 
 union netif_bond {
@@ -188,39 +196,14 @@ struct netif_ops {
     int (*op_open)(struct netif_port *dev);
     int (*op_stop)(struct netif_port *dev);
     int (*op_xmit)(struct rte_mbuf *m, struct netif_port *dev);
+    int (*op_update_addr)(struct netif_port *dev);
     int (*op_set_mc_list)(struct netif_port *dev);
-    int (*op_filter_supported)(struct netif_port *dev, enum rte_filter_type fltype);
-    int (*op_set_fdir_filt)(struct netif_port *dev, enum rte_filter_op op,
-                            const struct rte_eth_fdir_filter *filt);
     int (*op_get_queue)(struct netif_port *dev, lcoreid_t cid, queueid_t *qid);
     int (*op_get_link)(struct netif_port *dev, struct rte_eth_link *link);
     int (*op_get_promisc)(struct netif_port *dev, bool *promisc);
+    int (*op_get_allmulticast)(struct netif_port *dev, bool *allmulticast);
     int (*op_get_stats)(struct netif_port *dev, struct rte_eth_stats *stats);
-};
-
-struct netif_hw_addr {
-    struct list_head        list;
-    struct ether_addr       addr;
-    rte_atomic32_t          refcnt;
-    /*
-     * - sync only once!
-     *
-     *   for HA in upper dev, no matter how many times it's added,
-     *   only sync once to lower (when sync_cnt is zero).
-     *
-     *   and HA (upper)'s refcnt++, to mark lower dev own's it.
-     *
-     * - when to unsync?
-     *
-     *   when del if HA (upper dev)'s refcnt is 1 and syn_cnt is not zero.
-     *   means lower dev is the only owner and need be unsync.
-     */
-    int                     sync_cnt;
-};
-
-struct netif_hw_addr_list {
-    struct list_head        addrs;
-    int                     count;
+    int (*op_get_xstats)(struct netif_port *dev, netif_nic_xstats_get_t **xstats);
 };
 
 struct netif_port {
@@ -232,7 +215,7 @@ struct netif_port {
     int                     ntxq;                       /* tx queue numbe */
     uint16_t                rxq_desc_nb;                /* rx queue descriptor number */
     uint16_t                txq_desc_nb;                /* tx queue descriptor number */
-    struct ether_addr       addr;                       /* MAC address */
+    struct rte_ether_addr   addr;                       /* MAC address */
     struct netif_hw_addr_list mc;                       /* HW multicast list */
     int                     socket;                     /* socket id */
     int                     hw_header_len;              /* HW header length */
@@ -248,9 +231,12 @@ struct netif_port {
     struct netif_kni        kni;                        /* kni device */
     union netif_bond        *bond;                      /* bonding conf */
     struct vlan_info        *vlan_info;                 /* VLANs info for real device */
-    struct netif_tc         tc;                         /* traffic control */
+    struct netif_tc         tc[DPVS_MAX_LCORE];         /* traffic control */
     struct netif_ops        *netif_ops;
 } __rte_cache_aligned;
+
+/**************************** mbuf pool ********************************/
+extern struct rte_mempool *pktmbuf_pool[DPVS_MAX_SOCKET];
 
 /**************************** lcore API *******************************/
 int netif_xmit(struct rte_mbuf *mbuf, struct netif_port *dev);
@@ -265,18 +251,16 @@ int netif_register_master_xmit_msg(void);
 int netif_lcore_conf_set(int lcores, const struct netif_lcore_conf *lconf);
 bool is_lcore_id_valid(lcoreid_t cid);
 bool netif_lcore_is_fwd_worker(lcoreid_t cid);
-void lcore_process_packets(struct netif_queue_conf *qconf, struct rte_mbuf **mbufs,
-                           lcoreid_t cid, uint16_t count, bool pkts_from_ring);
+void lcore_process_packets(struct rte_mbuf **mbufs, lcoreid_t cid,
+                           uint16_t count, bool pkts_from_ring);
+int netif_rcv_mbuf(struct netif_port *dev, lcoreid_t cid,
+        struct rte_mbuf *mbuf, bool pkts_from_ring);
 
 /************************** protocol API *****************************/
 int netif_register_pkt(struct pkt_type *pt);
 int netif_unregister_pkt(struct pkt_type *pt);
 
 /**************************** port API ******************************/
-int netif_fdir_filter_set(struct netif_port *port, enum rte_filter_op opcode,
-                          const struct rte_eth_fdir_filter *fdir_flt);
-void netif_mask_fdir_filter(int af, const struct netif_port *port,
-                            struct rte_eth_fdir_filter *filt);
 struct netif_port* netif_port_get(portid_t id);
 /* port_conf can be NULL for default port configure */
 int netif_print_port_conf(const struct rte_eth_conf *port_conf, char *buf, int *len);
@@ -288,12 +272,12 @@ int netif_port_conf_get(struct netif_port *port, struct rte_eth_conf *eth_conf);
 int netif_port_conf_set(struct netif_port *port, const struct rte_eth_conf *conf);
 int netif_port_start(struct netif_port *port); // start nic and wait until up
 int netif_port_stop(struct netif_port *port); // stop nic
-int netif_set_mc_list(struct netif_port *port);
-int __netif_set_mc_list(struct netif_port *port);
 int netif_get_queue(struct netif_port *port, lcoreid_t id, queueid_t *qid);
 int netif_get_link(struct netif_port *dev, struct rte_eth_link *link);
 int netif_get_promisc(struct netif_port *dev, bool *promisc);
+int netif_get_allmulticast(struct netif_port *dev, bool *allmulticast);
 int netif_get_stats(struct netif_port *dev, struct rte_eth_stats *stats);
+int netif_get_xstats(struct netif_port *dev, netif_nic_xstats_get_t **xstats);
 struct netif_port *netif_alloc(size_t priv_size, const char *namefmt,
                                unsigned int nrxq, unsigned int ntxq,
                                void (*setup)(struct netif_port *));
@@ -312,16 +296,21 @@ int netif_ctrl_term(void); /* netif ctrl plane cleanup */
 void netif_cfgfile_init(void);
 void netif_keyword_value_init(void);
 void install_netif_keywords(void);
-
+void kni_ingress(struct rte_mbuf *mbuf, struct netif_port *dev);
 
 static inline void *netif_priv(struct netif_port *dev)
 {
     return (char *)dev + __ALIGN_KERNEL(sizeof(struct netif_port), NETIF_ALIGN);
 }
 
+static inline const void *netif_priv_const(const struct netif_port *dev)
+{
+    return (const char *)dev + __ALIGN_KERNEL(sizeof(struct netif_port), NETIF_ALIGN);
+}
+
 static inline struct netif_tc *netif_tc(struct netif_port *dev)
 {
-    return &dev->tc;
+    return &dev->tc[rte_lcore_id()];
 }
 
 static inline uint16_t dpvs_rte_eth_dev_count(void)
@@ -332,7 +321,5 @@ static inline uint16_t dpvs_rte_eth_dev_count(void)
     return rte_eth_dev_count_avail();
 #endif
 }
-
-extern bool dp_vs_fdir_filter_enable;
 
 #endif /* __DPVS_NETIF_H__ */

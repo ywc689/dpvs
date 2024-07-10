@@ -39,9 +39,9 @@ static void cls_help(void)
         "             [ CLS_TYPE [ COPTIONS ] ]\n"
         "\n"
         "Parameters:\n"
-        "    PKTTYPE    := { ipv4 | vlan }\n"
-        "    CLS_TYPE   := { match }\n"
-        "    COPTIONS   := { MATCH_OPTS }\n"
+        "    PKTTYPE    := { ipv4 | ipv6 | vlan }\n"
+        "    CLS_TYPE   := { match | ipset }\n"
+        "    COPTIONS   := { MATCH_OPTS | SET_OPTS }\n"
         "    PRIO       := NUMBER\n"
         "\n"
         "Match options:\n"
@@ -49,12 +49,16 @@ static void cls_help(void)
         "    PATTERN    := comma seperated of tokens below,\n"
         "                  { PROTO | SRANGE | DRANGE | IIF | OIF }\n"
         "    CHILD_QSCH := child qsch handle of the qsch cls attached.\n"
-        "    PROTO      := \"{ tcp | udp }\"\n"
+        "    PROTO      := \"{ tcp | sctp | udp }\"\n"
         "    SRANGE     := \"from=RANGE\"\n"
         "    DRANGE     := \"to=RANGE\"\n"
         "    RANGE      := ADDR[-ADDR][:PORT[-PORT]]\n"
         "    IIF        := \"iif=IFNAME\"\n"
         "    OIF        := \"oif=IFNAME\"\n"
+        "Set options:\n"
+        "    SET_OPTS   := match IPSET { target { CHILD_QSCH | drop } }\n"
+        "    IPSET      := SETNAME{,TARGET }\n"
+        "    TARGET     := \"{ src | dst }\"\n"
         "\n"
         "Examples:\n"
         "    dpip cls show dev dpdk0 qsch 1:\n"
@@ -63,19 +67,24 @@ static void cls_help(void)
         "    dpip cls add dev dpdk0 qsch 1: handle 1:10 \\\n"
         "         match pattern 'tcp,from=192.168.0.1:1-1024,oif=eth1'\\\n"
         "         target 1:1\n"
+        "    dpip cls add dev dpdk0 qsch root ipset match denyset,src target drop\n"
         "    dpip cls del dev dpdk0 qsch 1: handle 1:10\n"
         );
 }
 
-static void cls_dump_param(const char *ifname, const union tc_param *param)
+static void cls_dump_param(const char *ifname, const union tc_param *param,
+                           bool stats, bool verbose)
 {
     const struct tc_cls_param *cls = &param->cls;
     char handle[16], sch_id[16];
 
-    printf("cls %s %s dev %s %s pkttype 0x%04x prio %d ",
+    if (verbose)
+        printf("[%02d] ", cls->cid);
+
+    printf("cls %s %s dev %s qsch %s pkttype 0x%04x prio %d ",
            cls->kind, tc_handle_itoa(cls->handle, handle, sizeof(handle)),
            ifname, tc_handle_itoa(cls->sch_id, sch_id, sizeof(sch_id)),
-           cls->pkt_type, cls->priority);
+           ntohs(cls->pkt_type), cls->priority);
 
     if (strcmp(cls->kind, "match") == 0) {
         char result[32], patt[256], target[16];
@@ -89,9 +98,46 @@ static void cls_dump_param(const char *ifname, const union tc_param *param)
 
         printf("%s target %s",
                dump_match(m->proto, &m->match, patt, sizeof(patt)), result);
+    } else if (strcmp(cls->kind, "ipset") == 0) {
+        char result[32], target[16];
+        const struct tc_cls_ipset_copt *set = &cls->copt.set;
+
+        if (set->result.drop)
+            snprintf(result, sizeof(result), "%s", "drop");
+        else
+            snprintf(result, sizeof(result), "%s",
+                    tc_handle_itoa(set->result.sch_id, target, sizeof(target)));
+        printf("ipset match %s,%s target %s", set->setname,
+                set->dst_match ? "dst" : "src", result);
     }
 
     printf("\n");
+}
+
+static inline int parse_cls_ipset(const char *args, char *setname, bool *dst_match)
+{
+    size_t len;
+    char *dir;
+
+    *dst_match = false;  // default false
+
+    dir = strchr(args, ',');
+    if (dir) {
+        *dir++ = '\0';
+        if (strncmp(dir, "src", 3) == 0)
+            *dst_match = false;
+        else if (strncmp(dir, "dst", 3) == 0)
+            *dst_match = true;
+        else
+            return EDPVS_INVAL;
+    }
+
+    len = strlen(args);
+    if (!len || len >= IPSET_MAXNAMELEN)
+        return EDPVS_INVAL;
+    strncpy(setname, args, len);
+
+    return EDPVS_OK;
 }
 
 static int cls_parse(struct dpip_obj *obj, struct dpip_conf *cf)
@@ -102,9 +148,9 @@ static int cls_parse(struct dpip_obj *obj, struct dpip_conf *cf)
     memset(param, 0, sizeof(*param));
 
     /* default values */
-    param->pkt_type = ETH_P_IP;
+    param->pkt_type = htons(ETH_P_IP);
     param->handle = TC_H_UNSPEC;
-    param->sch_id = TC_H_ROOT; /* invalid qsch handle */
+    param->sch_id = TC_H_ROOT;
     param->priority = 0;
 
     while (cf->argc > 0) {
@@ -120,9 +166,11 @@ static int cls_parse(struct dpip_obj *obj, struct dpip_conf *cf)
         } else if (strcmp(CURRARG(cf), "pkttype") == 0) {
             NEXTARG_CHECK(cf, CURRARG(cf));
             if (strcasecmp(CURRARG(cf), "ipv4") == 0)
-                param->pkt_type = ETH_P_IP;
+                param->pkt_type = htons(ETH_P_IP);
+            else if (strcasecmp(CURRARG(cf), "ipv6") == 0)
+                param->pkt_type = htons(ETH_P_IPV6);
             else if (strcasecmp(CURRARG(cf), "vlan") == 0)
-                param->pkt_type = ETH_P_8021Q;
+                param->pkt_type = htons(ETH_P_8021Q);
             else {
                 fprintf(stderr, "pkttype not support\n");
                 return EDPVS_INVAL;
@@ -130,8 +178,10 @@ static int cls_parse(struct dpip_obj *obj, struct dpip_conf *cf)
         } else if (strcmp(CURRARG(cf), "prio") == 0) {
             NEXTARG_CHECK(cf, CURRARG(cf));
             param->priority = atoi(CURRARG(cf));
-        } else if (strcmp(CURRARG(cf), "match") == 0) {
+        } else if ((strcmp(CURRARG(cf), "match") == 0) && (!param->kind[0])) {
             snprintf(param->kind, TCNAMESIZ, "%s", "match");
+        } else if (strcmp(CURRARG(cf), "ipset") == 0) {
+            snprintf(param->kind, TCNAMESIZ, "%s", "ipset");
         } else { /* kind must be set adead then COPTIONS */
             if (strcmp(param->kind, "match") == 0) {
                 struct tc_cls_match_copt *m = &param->copt.match;
@@ -150,8 +200,23 @@ static int cls_parse(struct dpip_obj *obj, struct dpip_conf *cf)
                     else
                         m->result.sch_id = tc_handle_atoi(CURRARG(cf));
                 }
+            } else if (strcmp(param->kind, "ipset") == 0) {
+                struct tc_cls_ipset_copt *set = &param->copt.set;
+                if (strcmp(CURRARG(cf), "match") == 0) {
+                    NEXTARG_CHECK(cf, CURRARG(cf));
+                    if (parse_cls_ipset(CURRARG(cf), set->setname, &set->dst_match) != EDPVS_OK) {
+                        fprintf(stderr, "invalid ipset match: %s\n", CURRARG(cf));
+                        return EDPVS_INVAL;
+                    }
+                } else if (strcmp(CURRARG(cf), "target") == 0) {
+                    NEXTARG_CHECK(cf, CURRARG(cf));
+                    if (strcmp(CURRARG(cf), "drop") == 0)
+                        set->result.drop = true;
+                    else
+                        set->result.sch_id = tc_handle_atoi(CURRARG(cf));
+                }
             } else {
-                fprintf(stderr, "invalid/miss cls type: `%s'\n", param->kind);
+                fprintf(stderr, "invalid/miss cls type: '%s'\n", param->kind);
                 return EDPVS_INVAL;
             }
         }
@@ -186,6 +251,8 @@ static int cls_check(const struct dpip_obj *obj, dpip_cmd_t cmd)
                 fprintf(stderr, "invalid match pattern.\n");
                 return EDPVS_INVAL;
             }
+        } else if (strcmp(param->kind, "ipset") == 0) {
+            // TODO: check the existence of ipset?
         } else {
             fprintf(stderr, "invalid cls kind.\n");
             return EDPVS_INVAL;
@@ -206,6 +273,8 @@ static int cls_check(const struct dpip_obj *obj, dpip_cmd_t cmd)
                 fprintf(stderr, "invalid match pattern.\n");
                 return EDPVS_INVAL;
             }
+        } else if (strcmp(param->kind, "ipset") == 0) {
+            // TODO: check the existence of ipset?
         } else {
             fprintf(stderr, "invalid cls kind.\n");
             return EDPVS_INVAL;
@@ -235,6 +304,12 @@ static int cls_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
     int err, i;
     size_t size;
 
+    if (conf->stats)
+        tc_conf->op_flags |= TC_F_OPS_STATS;
+
+    if (conf->verbose)
+        tc_conf->op_flags |= TC_F_OPS_VERBOSE;
+
     switch (cmd) {
     case DPIP_CMD_ADD:
         return dpvs_setsockopt(SOCKOPT_TC_ADD, tc_conf,
@@ -261,7 +336,7 @@ static int cls_do_cmd(struct dpip_obj *obj, dpip_cmd_t cmd,
         }
 
         for (i = 0; i < size / sizeof(*params); i++)
-            cls_dump_param(tc_conf->ifname, &params[i]);
+            cls_dump_param(tc_conf->ifname, &params[i], conf->stats, conf->verbose);
 
         dpvs_sockopt_msg_free(params);
         return EDPVS_OK;

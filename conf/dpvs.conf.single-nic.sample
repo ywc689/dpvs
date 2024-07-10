@@ -15,6 +15,7 @@ global_defs {
     log_level   WARNING
     ! log_file    /var/log/dpvs.log
     ! log_async_mode    on
+    ! kni               on
 }
 
 ! netif config
@@ -32,12 +33,9 @@ netif_defs {
             queue_number        8
             descriptor_number   1024
         }
-        fdir {
-            mode                perfect
-            pballoc             64k
-            status              matched
-        }
+        ! mtu                   1500
         ! promisc_mode
+        ! allmulticast
         kni_name                dpdk0.kni
     }
 }
@@ -129,6 +127,7 @@ worker_defs {
     <init> worker   cpu8 {
         type        slave
         cpu_id      8
+        ! icmp_redirect_core
         port        dpdk0 {
             rx_queue_ids     7
             tx_queue_ids     7
@@ -137,14 +136,14 @@ worker_defs {
         }
     }
 
-    !<init> worker   cpu9 {
+    !<init> worker   cpu17 {
     !    type        kni
-    !    cpu_id      9
+    !    cpu_id      17
     !    port        dpdk0 {
+    !        rx_queue_ids     8
     !        tx_queue_ids     8
     !    }
     !}
-
 }
 
 ! timer config
@@ -157,6 +156,11 @@ timer_defs {
 neigh_defs {
     <init> unres_queue_length  128
     timeout                    60
+}
+
+! dpvs ipset config
+ipset_defs {
+    <init> ipset_hash_pool_size 131072
 }
 
 ! dpvs ipv4 config
@@ -188,9 +192,6 @@ ctrl_defs {
         sync_msg_timeout_us             20000
         priority_level                  low
     }
-    ipc_msg {
-        <init> unix_domain /var/run/dpvs_ctrl
-    }
 }
 
 ! ipvs config
@@ -209,6 +210,7 @@ ipvs_defs {
         uoa_mode        opp
         uoa_max_trail   3
         timeout {
+            oneway      60
             normal      300
             last        3
         }
@@ -235,9 +237,10 @@ ipvs_defs {
                 mss             1452
                 ttl             63
                 sack
-                ! wscale
+                ! wscale        0
                 ! timestamp
             }
+            close_client_window
             ! defer_rs_syn
             rs_syn_max_retry    3
             ack_storm_thresh    10
@@ -255,5 +258,6 @@ ipvs_defs {
 
 ! sa_pool config
 sa_pool {
-    pool_hash_size   16
+    pool_hash_size  16
+    flow_enable     on
 }

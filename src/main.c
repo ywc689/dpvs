@@ -30,6 +30,7 @@
 #include "pidfile.h"
 #include "dpdk.h"
 #include "conf/common.h"
+#include "log.h"
 #include "netif.h"
 #include "vlan.h"
 #include "inet.h"
@@ -38,6 +39,7 @@
 #include "ipv4.h"
 #include "neigh.h"
 #include "sa_pool.h"
+#include "ipset/ipset.h"
 #include "ipvs/ipvs.h"
 #include "cfgfile.h"
 #include "ip_tunnel.h"
@@ -46,18 +48,20 @@
 #include "iftraf.h"
 #include "eal_mem.h"
 #include "scheduler.h"
+#include "pdump.h"
 
 #define DPVS    "dpvs"
 #define RTE_LOGTYPE_DPVS RTE_LOGTYPE_USER1
 
 #define LCORE_CONF_BUFFER_LEN 4096
 
-#ifdef CONFIG_DPVS_PDUMP
-extern bool g_dpvs_pdump;
+static void inline dpdk_version_check(void)
+{
+#if RTE_VERSION < RTE_VERSION_NUM(20, 11, 1, 0)
+    rte_panic("The current DPVS needs dpdk-stable-20.11.1 or higher. "
+            "Try old releases if you are using earlier dpdk versions.");
 #endif
-extern int log_slave_init(void);
-
-
+}
 
 /*
  * the initialization order of all the modules
@@ -67,20 +71,24 @@ extern int log_slave_init(void);
                     dpvs_scheduler_init, dpvs_scheduler_term),  \
         DPVS_MODULE(MODULE_GLOBAL_DATA, "global data",          \
                     global_data_init,    global_data_term),     \
+        DPVS_MODULE(MODULE_MBUF,        "mbuf",                 \
+                    mbuf_init,           NULL),                 \
         DPVS_MODULE(MODULE_CFG,         "config file",          \
                     cfgfile_init,        cfgfile_term),         \
+        DPVS_MODULE(MODULE_PDUMP,        "pdump",               \
+                    pdump_init,          pdump_term),           \
         DPVS_MODULE(MODULE_NETIF_VDEV,  "vdevs",                \
                     netif_vdevs_add,     NULL),                 \
         DPVS_MODULE(MODULE_TIMER,       "timer",                \
                     dpvs_timer_init,     dpvs_timer_term),      \
         DPVS_MODULE(MODULE_TC,          "tc",                   \
-                    tc_init,             NULL),                 \
+                    tc_init,             tc_term),              \
         DPVS_MODULE(MODULE_NETIF,       "netif",                \
                     netif_init,          netif_term),           \
-        DPVS_MODULE(MODULE_CTRL,        "cp",                   \
+        DPVS_MODULE(MODULE_CTRL,        "ctrl",                 \
                     ctrl_init,           ctrl_term),            \
-        DPVS_MODULE(MODULE_TC_CTRL,     "tc cp",                \
-                    tc_ctrl_init,        NULL),                 \
+        DPVS_MODULE(MODULE_TC_CTRL,     "tc_ctrl",              \
+                    tc_ctrl_init,        tc_ctrl_term),         \
         DPVS_MODULE(MODULE_VLAN,        "vlan",                 \
                     vlan_init,           NULL),                 \
         DPVS_MODULE(MODULE_INET,        "inet",                 \
@@ -89,14 +97,18 @@ extern int log_slave_init(void);
                     sa_pool_init,        sa_pool_term),         \
         DPVS_MODULE(MODULE_IP_TUNNEL,   "tunnel",               \
                     ip_tunnel_init,      ip_tunnel_term),       \
+        DPVS_MODULE(MODULE_IPSET,       "ipset",                \
+                    ipset_init,          ipset_term),           \
         DPVS_MODULE(MODULE_VS,          "ipvs",                 \
                     dp_vs_init,          dp_vs_term),           \
         DPVS_MODULE(MODULE_NETIF_CTRL,  "netif ctrl",           \
                     netif_ctrl_init,     netif_ctrl_term),      \
         DPVS_MODULE(MODULE_IFTRAF,      "iftraf",               \
                     iftraf_init,         iftraf_term),          \
-        DPVS_MODULE(MODULE_LAST,        "iftraf",               \
-                    eal_mem_init,        eal_mem_term)          \
+        DPVS_MODULE(MODULE_EAL_MEM,     "eal_mem",              \
+                    eal_mem_init,        eal_mem_term),         \
+        DPVS_MODULE(MODULE_LAST,        "last",                 \
+                    NULL,                NULL)                  \
     }
 
 #define DPVS_MODULE(a, b, c, d)  a
@@ -186,14 +198,17 @@ static void dpvs_usage(const char *prgname)
 {
     printf("\nUsage: %s ", prgname);
     printf("DPVS application options:\n"
-            "   -v  version     display DPVS version info\n"
-            "   -h  help        display DPVS help info\n"
+            "   -v, --version           display DPVS version info\n"
+            "   -c, --conf FILE         specify config file for DPVS\n"
+            "   -p, --pid-file FILE     specify pid file of DPVS process\n"
+            "   -x, --ipc-file FILE     specify unix socket file for ipc communication between DPVS and Tools\n"
+            "   -h, --help              display DPVS help info\n"
     );
 }
 
 static int parse_app_args(int argc, char **argv)
 {
-    const char *short_options = "vh";
+    const char *short_options = "vhc:p:x:";
     char *prgname = argv[0];
     int c, ret = -1;
 
@@ -203,6 +218,9 @@ static int parse_app_args(int argc, char **argv)
 
     struct option long_options[] = {
         {"version", 0, NULL, 'v'},
+        {"conf", required_argument, NULL, 'c'},
+        {"pid-file", required_argument, NULL, 'p'},
+        {"ipc-file", required_argument, NULL, 'x'},
         {"help", 0, NULL, 'h'},
         {NULL, 0, 0, 0}
     };
@@ -216,6 +234,15 @@ static int parse_app_args(int argc, char **argv)
                         DPVS_VERSION,
                         DPVS_BUILD_DATE);
                 exit(EXIT_SUCCESS);
+            case 'c':
+                dpvs_conf_file=optarg;
+                break;
+            case 'p':
+                dpvs_pid_file=optarg;
+                break;
+            case 'x':
+                dpvs_ipc_file=optarg;
+                break;
             case 'h':
                 dpvs_usage(prgname);
                 exit(EXIT_SUCCESS);
@@ -236,6 +263,16 @@ static int parse_app_args(int argc, char **argv)
     optopt = old_optopt;
     optarg = old_optarg;
 
+    /* check */
+    if (!dpvs_conf_file)
+        dpvs_conf_file="/etc/dpvs.conf";
+    if (!dpvs_pid_file)
+        dpvs_pid_file="/var/run/dpvs.pid";
+    if (!dpvs_ipc_file)
+        dpvs_ipc_file="/var/run/dpvs.ipc";
+
+    g_version = version_parse(DPVS_VERSION);
+
     return ret;
 }
 
@@ -247,6 +284,8 @@ int main(int argc, char *argv[])
     struct timeval tv;
     char pql_conf_buf[LCORE_CONF_BUFFER_LEN];
     int pql_conf_buf_len = LCORE_CONF_BUFFER_LEN;
+
+    dpdk_version_check();
 
     /**
      * add application agruments parse before EAL ones.
@@ -263,7 +302,7 @@ int main(int argc, char *argv[])
     argc -= err, argv += err;
 
     /* check if dpvs is running and remove zombie pidfile */
-    if (dpvs_running(DPVS_PIDFILE)) {
+    if (dpvs_running(dpvs_pid_file)) {
         fprintf(stderr, "dpvs is already running\n");
         exit(EXIT_FAILURE);
     }
@@ -272,6 +311,7 @@ int main(int argc, char *argv[])
 
     gettimeofday(&tv, NULL);
     srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
+    rte_srand((uint64_t)(tv.tv_sec ^ tv.tv_usec ^ getpid()));
     sys_start_time();
 
     if (get_numa_nodes() > DPVS_MAX_SOCKET) {
@@ -289,18 +329,11 @@ int main(int argc, char *argv[])
         rte_exit(EXIT_FAILURE, "Invalid EAL parameters\n");
 
     RTE_LOG(INFO, DPVS, "dpvs version: %s, build on %s\n", DPVS_VERSION, DPVS_BUILD_DATE);
+    RTE_LOG(INFO, DPVS, "dpvs-conf-file: %s\n", dpvs_conf_file);
+    RTE_LOG(INFO, DPVS, "dpvs-pid-file: %s\n", dpvs_pid_file);
+    RTE_LOG(INFO, DPVS, "dpvs-ipc-file: %s\n", dpvs_ipc_file);
 
     rte_timer_subsystem_init();
-
-#ifdef CONFIG_DPVS_PDUMP
-    if (g_dpvs_pdump) {
-        /* initialize packet capture framework */
-        err = rte_pdump_init(NULL);
-        if (err < 0) {
-            rte_exit(EXIT_FAILURE, "Fail to init dpdk pdump framework\n");
-        }
-    }
-#endif
 
     modules_init();
 
@@ -321,16 +354,17 @@ int main(int argc, char *argv[])
 
     /* print port-queue-lcore relation */
     netif_print_lcore_conf(pql_conf_buf, &pql_conf_buf_len, true, 0);
-    RTE_LOG(INFO, DPVS, "\nport-queue-lcore relation array: \n%s\n",
+    RTE_LOG(INFO, DPVS, "port-queue-lcore relation array: \n%s\n",
             pql_conf_buf);
-
-    log_slave_init();
 
     /* start slave worker threads */
     dpvs_lcore_start(0);
 
+    /* start async logging worker thread */
+    log_slave_init();
+
     /* write pid file */
-    if (!pidfile_write(DPVS_PIDFILE, getpid()))
+    if (!pidfile_write(dpvs_pid_file, getpid()))
         goto end;
 
     dpvs_state_set(DPVS_STATE_NORMAL);
@@ -342,15 +376,7 @@ end:
     dpvs_state_set(DPVS_STATE_FINISH);
     modules_term();
 
-#ifdef CONFIG_DPVS_PDUMP
-    if (g_dpvs_pdump) {
-        if ((err = rte_pdump_uninit()) != 0) {
-            RTE_LOG(ERR, DPVS, "Fail to uninitialize dpdk pdump framework.\n");
-        }
-    }
-#endif
-
-    pidfile_rm(DPVS_PIDFILE);
+    pidfile_rm(dpvs_pid_file);
 
     exit(0);
 }

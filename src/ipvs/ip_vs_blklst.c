@@ -87,7 +87,7 @@ static int dp_vs_blklst_add_lcore(int af, uint8_t proto, const union inet_addr *
     hashkey = blklst_hashkey(vaddr, blklst);
 
     new = rte_zmalloc("new_blklst_entry", sizeof(struct blklst_entry), 0);
-    if (new == NULL)
+    if (unlikely(new == NULL))
         return EDPVS_NOMEM;
 
     new->af    = af;
@@ -131,7 +131,7 @@ static int dp_vs_blklst_add(int af, uint8_t proto, const union inet_addr *vaddr,
     struct dpvs_msg *msg;
     struct dp_vs_blklst_conf cf;
 
-    if (cid != rte_get_master_lcore()) {
+    if (cid != rte_get_main_lcore()) {
         RTE_LOG(INFO, SERVICE, "%s must set from master lcore\n", __func__);
         return EDPVS_NOTSUPP;
     }
@@ -145,8 +145,8 @@ static int dp_vs_blklst_add(int af, uint8_t proto, const union inet_addr *vaddr,
 
     /*set blklst ip on master lcore*/
     err = dp_vs_blklst_add_lcore(af, proto, vaddr, vport, blklst);
-    if (err) {
-        RTE_LOG(INFO, SERVICE, "[%s] fail to set blklst ip -- %s\n", __func__, dpvs_strerror(err));
+    if (err && err != EDPVS_EXIST) {
+        RTE_LOG(ERR, SERVICE, "[%s] fail to set blklst ip -- %s\n", __func__, dpvs_strerror(err));
         return err;
     }
 
@@ -174,7 +174,7 @@ static int dp_vs_blklst_del(int af, uint8_t proto, const union inet_addr *vaddr,
     struct dpvs_msg *msg;
     struct dp_vs_blklst_conf cf;
 
-    if (cid != rte_get_master_lcore()) {
+    if (cid != rte_get_main_lcore()) {
         RTE_LOG(INFO, SERVICE, "%s must set from master lcore\n", __func__);
         return EDPVS_NOTSUPP;
     }
@@ -189,7 +189,6 @@ static int dp_vs_blklst_del(int af, uint8_t proto, const union inet_addr *vaddr,
     /*del blklst ip on master lcores*/
     err = dp_vs_blklst_del_lcore(af, proto, vaddr, vport, blklst);
     if (err) {
-        RTE_LOG(INFO, SERVICE, "%s: fail to del blklst ip -- %s\n", __func__, dpvs_strerror(err));
         return err;
     }
 
@@ -323,13 +322,15 @@ static int blklst_msg_process(bool add, struct dpvs_msg *msg)
     }
 
     cf = (struct dp_vs_blklst_conf *)msg->data;
-    if (add)
+    if (add) {
         err = dp_vs_blklst_add_lcore(cf->af, cf->proto, &cf->vaddr, cf->vport, &cf->blklst);
-    else
+	    if (err && err != EDPVS_EXIST) {
+		    RTE_LOG(ERR, SERVICE, "%s: fail to add blklst: %s.\n", __func__, dpvs_strerror(err));
+		}
+	}
+    else {
         err = dp_vs_blklst_del_lcore(cf->af, cf->proto, &cf->vaddr, cf->vport, &cf->blklst);
-    if (err != EDPVS_OK)
-        RTE_LOG(ERR, SERVICE, "%s: fail to %s blklst: %s.\n",
-                __func__, add ? "add" : "del", dpvs_strerror(err));
+	}
 
     return err;
 }
@@ -393,8 +394,8 @@ int dp_vs_blklst_init(void)
 
     rte_atomic32_set(&this_num_blklsts, 0);
 
-    rte_eal_mp_remote_launch(blklst_lcore_init, NULL, CALL_MASTER);
-    RTE_LCORE_FOREACH_SLAVE(cid) {
+    rte_eal_mp_remote_launch(blklst_lcore_init, NULL, CALL_MAIN);
+    RTE_LCORE_FOREACH_WORKER(cid) {
         if ((err = rte_eal_wait_lcore(cid)) < 0) {
             RTE_LOG(WARNING, SERVICE, "%s: lcore %d: %s.\n",
                     __func__, cid, dpvs_strerror(err));
@@ -441,8 +442,8 @@ int dp_vs_blklst_term(void)
     if ((err = sockopt_unregister(&blklst_sockopts)) != EDPVS_OK)
         return err;
 
-    rte_eal_mp_remote_launch(blklst_lcore_term, NULL, CALL_MASTER);
-    RTE_LCORE_FOREACH_SLAVE(cid) {
+    rte_eal_mp_remote_launch(blklst_lcore_term, NULL, CALL_MAIN);
+    RTE_LCORE_FOREACH_WORKER(cid) {
         if ((err = rte_eal_wait_lcore(cid)) < 0) {
             RTE_LOG(WARNING, SERVICE, "%s: lcore %d: %s.\n",
                     __func__, cid, dpvs_strerror(err));

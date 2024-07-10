@@ -34,17 +34,18 @@
 #include "conf/common.h"
 #include "dpdk.h"
 #include "netif.h"
-#include "netif_addr.h"
+#include "conf/netif_addr.h"
+#include "ctrl.h"
 #include "kni.h"
+#include "vlan.h"
+#include "conf/kni.h"
+#include "conf/sockopts.h"
 
 #define Kni /* KNI is defined */
 #define RTE_LOGTYPE_Kni     RTE_LOGTYPE_USER1
 
-#define KNI_DEF_MBUF_SIZE       2048
-#define KNI_MBUFPOOL_ELEMS      65535
-#define KNI_MBUFPOOL_CACHE_SIZE 256
-
-static struct rte_mempool *kni_mbuf_pool[DPVS_MAX_SOCKET];
+#define KNI_RX_RING_ELEMS       2048
+bool g_kni_enabled = true;
 
 static void kni_fill_conf(const struct netif_port *dev, const char *ifname,
                           struct rte_kni_conf *conf)
@@ -53,7 +54,15 @@ static void kni_fill_conf(const struct netif_port *dev, const char *ifname,
 
     memset(conf, 0, sizeof(*conf));
     conf->group_id = dev->id;
-    conf->mbuf_size = KNI_DEF_MBUF_SIZE;
+    conf->mbuf_size = rte_pktmbuf_data_room_size(pktmbuf_pool[dev->socket]) - RTE_PKTMBUF_HEADROOM;
+
+    /*
+     * kni device should use same mac as real device,
+     * because it may config same IP of real device.
+     * diff mac means kni cannot accept packets sent
+     * to real-device.
+     */
+    memcpy(conf->mac_addr, dev->addr.addr_bytes, sizeof(conf->mac_addr));
 
     if (dev->type == PORT_TYPE_GENERAL) { /* dpdk phy device */
         rte_eth_dev_info_get(dev->id, &info);
@@ -83,23 +92,23 @@ static void kni_fill_conf(const struct netif_port *dev, const char *ifname,
 }
 
 static int kni_mc_list_cmp_set(struct netif_port *dev,
-                               struct ether_addr *addrs, size_t naddr)
+                               struct rte_ether_addr *addrs, size_t naddr)
 {
     int err = EDPVS_INVAL, i, j;
-    struct ether_addr addrs_old[NETIF_MAX_HWADDR];
+    struct rte_ether_addr addrs_old[NETIF_MAX_HWADDR];
     size_t naddr_old;
     char mac[64];
     struct mc_change_list {
-        size_t              naddr;
-        struct ether_addr   addrs[NETIF_MAX_HWADDR*2];
+        size_t                  naddr;
+        struct rte_ether_addr   addrs[NETIF_MAX_HWADDR*2];
         /* state: 0 - unchanged, 1 - added, 2 deleted. */
-        int                 states[NETIF_MAX_HWADDR*2];
+        int                     states[NETIF_MAX_HWADDR*2];
     } chg_lst = {0};
 
     rte_rwlock_write_lock(&dev->dev_lock);
 
     naddr_old = NELEMS(addrs_old);
-    err = __netif_mc_dump(dev, addrs_old, &naddr_old);
+    err = __netif_mc_dump(dev, HW_ADDR_F_FROM_KNI, addrs_old, &naddr_old);
     if (err != EDPVS_OK) {
         RTE_LOG(ERR, Kni, "%s: fail to get current mc list\n", __func__);
         goto out;
@@ -116,7 +125,7 @@ static int kni_mc_list_cmp_set(struct netif_port *dev,
     /* add all addrs from netlink(linux) to change-list and
      * assume they're all new added by default. */
     for (i = 0; i < naddr; i++) {
-        ether_addr_copy(&addrs[i], &chg_lst.addrs[i]);
+        rte_ether_addr_copy(&addrs[i], &chg_lst.addrs[i]);
         chg_lst.states[i] = 1;
 
         RTE_LOG(DEBUG, Kni, "    new [%02d] %s\n", i,
@@ -140,7 +149,7 @@ static int kni_mc_list_cmp_set(struct netif_port *dev,
             /* deleted */
             assert(chg_lst.naddr < NETIF_MAX_HWADDR * 2);
 
-            ether_addr_copy(&addrs_old[i], &chg_lst.addrs[chg_lst.naddr]);
+            rte_ether_addr_copy(&addrs_old[i], &chg_lst.addrs[chg_lst.naddr]);
             chg_lst.states[chg_lst.naddr] = 2;
             chg_lst.naddr++;
         }
@@ -153,14 +162,14 @@ static int kni_mc_list_cmp_set(struct netif_port *dev,
             /* nothing */
             break;
         case 1:
-            err = __netif_mc_add(dev, &chg_lst.addrs[i]);
+            err = __netif_hw_addr_add(&dev->mc, &chg_lst.addrs[i], HW_ADDR_F_FROM_KNI);
 
             RTE_LOG(INFO, Kni, "%s: add mc addr: %s %s %s\n", __func__,
                     eth_addr_dump(&chg_lst.addrs[i], mac, sizeof(mac)),
                     dev->name, dpvs_strerror(err));
             break;
         case 2:
-            err = __netif_mc_del(dev, &chg_lst.addrs[i]);
+            err = __netif_hw_addr_del(&dev->mc, &chg_lst.addrs[i], HW_ADDR_F_FROM_KNI);
 
             RTE_LOG(INFO, Kni, "%s: del mc addr: %s %s %s\n", __func__,
                     eth_addr_dump(&chg_lst.addrs[i], mac, sizeof(mac)),
@@ -188,7 +197,7 @@ static int kni_update_maddr(struct netif_port *dev)
     char line[1024];
     int ifindex, users, st; /* @st for static */
     char ifname[IFNAMSIZ], hexa[256]; /* hex address */
-    struct ether_addr ma_list[NETIF_MAX_HWADDR];
+    struct rte_ether_addr ma_list[NETIF_MAX_HWADDR];
     int n_ma;
 
     fp = fopen("/proc/net/dev_mcast", "r");
@@ -237,7 +246,7 @@ static int kni_rtnl_check(void *arg)
 {
     struct netif_port *dev = arg;
     int fd = dev->kni.kni_rtnl_fd;
-    int n, i;
+    int n, i, link_flags = 0;
     char buf[4096];
     struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
     bool update = false;
@@ -275,6 +284,14 @@ static int kni_rtnl_check(void *arg)
     /* note we should not update kni mac list for every event ! */
     if (update) {
         RTE_LOG(DEBUG, Kni, "%d events received!\n", i);
+        if (EDPVS_OK != linux_get_link_status(dev->kni.name, &link_flags, NULL, 0)) {
+            RTE_LOG(ERR, Kni, "%s：undetermined kni link status\n", dev->kni.name);
+            return DTIMER_OK;
+        }
+        if (!(link_flags & IFF_UP)) {
+            RTE_LOG(DEBUG, Kni, "skip link down kni device %s\n", dev->kni.name);
+            return DTIMER_OK;
+        }
         if (kni_update_maddr(dev) == EDPVS_OK)
             RTE_LOG(DEBUG, Kni, "update maddr of %s OK!\n", dev->name);
         else
@@ -337,6 +354,9 @@ int kni_add_dev(struct netif_port *dev, const char *kniname)
     char ring_name[RTE_RING_NAMESIZE];
     struct rte_ring *rb;
 
+    if (!g_kni_enabled)
+        return EDPVS_OK;
+
     if (!dev)
         return EDPVS_INVAL;
 
@@ -351,7 +371,7 @@ int kni_add_dev(struct netif_port *dev, const char *kniname)
 
     kni_fill_conf(dev, kniname, &conf);
 
-    kni = rte_kni_alloc(kni_mbuf_pool[dev->socket], &conf, NULL);
+    kni = rte_kni_alloc(pktmbuf_pool[dev->socket], &conf, NULL);
     if (!kni)
         return EDPVS_DPDKAPIFAIL;
 
@@ -361,23 +381,9 @@ int kni_add_dev(struct netif_port *dev, const char *kniname)
         return err;
     }
 
-    /*
-     * kni device should use same mac as real device,
-     * because it may config same IP of real device.
-     * diff mac means kni cannot accept packets sent
-     * to real-device.
-     */
-    err = linux_set_if_mac(conf.name, (unsigned char *)&dev->addr);
-    if (err != EDPVS_OK) {
-        char mac[18];
-        ether_format_addr(mac, sizeof(mac), &dev->addr);
-        RTE_LOG(WARNING, Kni, "%s: fail to set mac %s for %s: %s\n",
-                __func__, mac, conf.name, strerror(errno));
-    }
-
     snprintf(ring_name, sizeof(ring_name), "kni_rx_ring_%s",
              conf.name);
-    rb = rte_ring_create(ring_name, KNI_DEF_MBUF_SIZE,
+    rb = rte_ring_create(ring_name, KNI_RX_RING_ELEMS,
                          rte_socket_id(), RING_F_SC_DEQ);
     if (unlikely(!rb)) {
         RTE_LOG(ERR, KNI, "[%s] Failed to create kni rx ring.\n", __func__);
@@ -389,11 +395,15 @@ int kni_add_dev(struct netif_port *dev, const char *kniname)
     dev->kni.addr = dev->addr;
     dev->kni.kni = kni;
     dev->kni.rx_ring = rb;
+    INIT_LIST_HEAD(&dev->kni.kni_flows);
     return EDPVS_OK;
 }
 
 int kni_del_dev(struct netif_port *dev)
 {
+    if (!g_kni_enabled)
+        return EDPVS_OK;
+
     if (!kni_dev_exist(dev))
         return EDPVS_INVAL;
 
@@ -404,19 +414,327 @@ int kni_del_dev(struct netif_port *dev)
     return EDPVS_OK;
 }
 
+/////////////// KNI FLOW //////////////
+
+/*
+ * Kni Address Flow:
+ * The idea is to specify kni interface with an ip address, and isolate all traffic
+ * target at the address to a dedicated nic rx-queue, which may avoid disturbances
+ * of dataplane when overload.
+ * Note that not all nic can support this flow type under the premise of sapool.
+ * See `check_kni_addr_flow_support` for supported nics as we known so far. It's
+ * encouraged to add more nic types satisfied the flow type.
+ */
+
+#define NETDEV_IXGBE_DRIVER_NAME      "ixgbe"
+#define NETDEV_I40E_DRIVER_NAME       "i40e"
+#define NETDEV_MLNX_DRIVER_NAME       "mlx5"
+
+static bool check_kni_addr_flow_support(const struct netif_port *dev)
+{
+    if (dev->type == PORT_TYPE_BOND_MASTER) {
+        int i;
+        for (i = 0; i < dev->bond->master.slave_nb; i++) {
+            if (!check_kni_addr_flow_support(dev->bond->master.slaves[i]))
+                return false;
+        }
+        return true;
+    } else if (dev->type == PORT_TYPE_VLAN) {
+        const struct vlan_dev_priv *vlan = netif_priv_const(dev);
+        assert(vlan && vlan->real_dev);
+        return check_kni_addr_flow_support(vlan->real_dev);
+    }
+
+    // PMD drivers support kni address flow
+    //  - mlx5
+    //  - ixgbe
+    //  - ...
+    // PMD drivers do NOT support kni address flow
+    //  - ...
+    if (strstr(dev->dev_info.driver_name, NETDEV_MLNX_DRIVER_NAME))
+        return true;
+    if (strstr(dev->dev_info.driver_name, NETDEV_IXGBE_DRIVER_NAME))
+        return true;
+
+    // TODO：check and then add more supported types
+
+    return false;
+}
+
+static inline int kni_addr_flow_allowed(const struct netif_port *dev)
+{
+    if (!g_kni_lcore_id)
+        return EDPVS_DISABLED;
+
+    if (dev->type != PORT_TYPE_GENERAL
+            && dev->type != PORT_TYPE_VLAN
+            && dev->type != PORT_TYPE_BOND_MASTER) {
+        RTE_LOG(WARNING, KNI, "%s: kni addr flow only supports physical (exclusive"
+                " of bonding slaves), vlan, and bonding master devices\n", __func__);
+        return EDPVS_NOTSUPP;
+    }
+
+    if (!check_kni_addr_flow_support(dev)) {
+        RTE_LOG(WARNING, KNI, "%s: %s (driver: %s) doesn't support kni address flow, steer kni "
+                "traffic onto slave workers\n", __func__, dev->name, dev->dev_info.driver_name);
+        return EDPVS_NOTSUPP;
+    }
+
+    return EDPVS_OK;
+}
+
+static struct kni_addr_flow* kni_addr_flow_lookup(const struct netif_port *dev,
+                             const struct kni_addr_flow_entry *param) {
+    struct kni_addr_flow *flow;
+    if (unlikely(!param || !dev))
+        return NULL;
+
+    list_for_each_entry(flow, &dev->kni.kni_flows, node) {
+        if (flow->af == param->af &&
+                inet_addr_equal(flow->af, &flow->addr, &param->addr))
+            return flow;
+    }
+    return NULL;
+}
+
+static int kni_addr_flow_add(struct netif_port *dev, const struct kni_addr_flow_entry *param)
+{
+    int err;
+    struct kni_addr_flow *flow;
+    struct netif_flow_handler_param flow_handlers;
+
+    if ((err = kni_addr_flow_allowed(dev)) != EDPVS_OK)
+        return err;
+
+    if (kni_addr_flow_lookup(dev, param))
+        return EDPVS_EXIST;
+
+    flow = rte_malloc("kni_addr_flow", sizeof(struct kni_addr_flow), RTE_CACHE_LINE_SIZE);
+    if (unlikely(flow == NULL))
+        return EDPVS_NOMEM;
+    flow->af = param->af;
+    flow->addr = param->addr;
+    flow->dev = dev;
+    flow->kni_worker = g_kni_lcore_id;
+
+    flow_handlers.size = NELEMS(flow->flows),
+    flow_handlers.flow_num = 0,
+    flow_handlers.handlers = &flow->flows[0],
+    err = netif_kni_flow_add(dev, flow->kni_worker, flow->af, &flow->addr, &flow_handlers);
+    if (err != EDPVS_OK) {
+        rte_free(flow);
+        return err;
+    }
+    flow->nflows = flow_handlers.flow_num;
+
+    list_add(&flow->node, &dev->kni.kni_flows);
+
+    return EDPVS_OK;
+}
+
+static int kni_addr_flow_del(struct netif_port *dev, const struct kni_addr_flow_entry *param)
+{
+    int err;
+    struct kni_addr_flow *flow;
+    struct netif_flow_handler_param flow_handlers;
+
+    if ((err = kni_addr_flow_allowed(dev)) != EDPVS_OK)
+        return err;
+
+    flow = kni_addr_flow_lookup(dev, param);
+    if (!flow)
+        return EDPVS_NOTEXIST;
+
+    list_del(&flow->node);
+
+    flow_handlers.size = NELEMS(flow->flows);
+    flow_handlers.flow_num = flow->nflows;
+    flow_handlers.handlers = &flow->flows[0];
+    err = netif_kni_flow_del(dev, flow->kni_worker, flow->af, &flow->addr, &flow_handlers);
+    if (err != EDPVS_OK) {
+        list_add(&flow->node, &dev->kni.kni_flows);
+        return err;
+    }
+
+    rte_free(flow);
+    return EDPVS_OK;
+}
+
+static int kni_addr_flow_flush(struct netif_port *dev)
+{
+    int err, retval = EDPVS_OK;
+    struct kni_addr_flow *flow, *next;
+    struct netif_flow_handler_param flow_handlers;
+
+    if ((err = kni_addr_flow_allowed(dev)) != EDPVS_OK)
+        return err;
+
+    list_for_each_entry_safe(flow, next, &dev->kni.kni_flows, node) {
+        list_del(&flow->node);
+        flow_handlers.size = NELEMS(flow->flows);
+        flow_handlers.flow_num = flow->nflows;
+        flow_handlers.handlers = &flow->flows[0];
+        err = netif_kni_flow_del(dev, flow->kni_worker, flow->af, &flow->addr, &flow_handlers);
+        if (err != EDPVS_OK) {
+            retval = err;
+            list_add(&flow->node, &dev->kni.kni_flows);
+        } else {
+            rte_free(flow);
+        }
+    }
+
+    return retval;
+}
+
+static void inline kni_addr_flow_fill_entry(const struct kni_addr_flow *flow,
+        struct kni_conf_param *entry) {
+    snprintf(entry->ifname, sizeof(entry->ifname), "%s", flow->dev->name);
+    entry->type = KNI_DTYPE_ADDR_FLOW;
+    entry->data.flow.af = flow->af;
+    entry->data.flow.addr = flow->addr;
+}
+
+static int kni_addr_flow_get(struct netif_port *dev, const struct kni_addr_flow_entry *param,
+        struct kni_info **pentries, int *plen)
+{
+    int i, n, err;
+    size_t memlen;
+    struct kni_addr_flow *flow;
+    struct kni_info *info;
+
+    if ((err = kni_addr_flow_allowed(dev)) != EDPVS_OK)
+        return err;
+
+    i = 0;
+    n = list_elems(&dev->kni.kni_flows);
+    memlen = sizeof(struct kni_info) + n * sizeof(struct kni_conf_param);
+    info = rte_calloc("kni_addr_flow_get", 1, memlen, RTE_CACHE_LINE_SIZE);
+    if (unlikely(!info))
+        return EDPVS_NOMEM;
+
+    list_for_each_entry(flow, &dev->kni.kni_flows, node) {
+        assert(i < n);
+        kni_addr_flow_fill_entry(flow, &info->entries[i++]);
+    }
+    assert(i == n);
+    info->len = n;
+
+    *plen = memlen;
+    *pentries = info;
+    return EDPVS_OK;
+}
+
+/////////////// KNI FLOW END //////////////
+
+static int kni_sockopt_set(sockoptid_t opt, const void *conf, size_t size)
+{
+    const struct kni_conf_param *param = conf;
+    struct netif_port *dev;
+
+    if (!conf || size < sizeof(struct kni_conf_param))
+        return EDPVS_INVAL;
+
+    if (param->type != KNI_DTYPE_ADDR_FLOW)
+        return EDPVS_NOTSUPP;
+
+    dev = netif_port_get_by_name(param->ifname);
+    if (!dev)
+        return EDPVS_NOTEXIST;
+
+    switch (opt) {
+        case SOCKOPT_SET_KNI_ADD:
+            return kni_addr_flow_add(dev, &param->data.flow);
+        case SOCKOPT_SET_KNI_DEL:
+            return kni_addr_flow_del(dev, &param->data.flow);
+        case SOCKOPT_SET_KNI_FLUSH:
+            return kni_addr_flow_flush(dev);
+        default:
+            return EDPVS_NOTSUPP;
+    }
+
+    return EDPVS_OK;
+}
+
+static int kni_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
+                        void **out, size_t *outsize)
+{
+    int err, len = 0;
+    struct netif_port *dev;
+    struct kni_info *info = NULL;
+    const struct kni_conf_param *param = conf;
+
+    if (!conf || size < sizeof(struct kni_conf_param) || !out || !outsize)
+        return EDPVS_INVAL;
+
+    if (opt != SOCKOPT_GET_KNI_LIST)
+        return EDPVS_NOTSUPP;
+
+    if (param->type != KNI_DTYPE_ADDR_FLOW)
+        return EDPVS_NOTSUPP;
+
+    dev = netif_port_get_by_name(param->ifname);
+    if (!dev)
+        return EDPVS_NOTEXIST;
+
+    err = kni_addr_flow_get(dev, &param->data.flow, &info, &len);
+    if (err != EDPVS_OK)
+        return err;
+
+    *out = info;
+    *outsize = len;
+    return EDPVS_OK;
+}
+
+static struct dpvs_sockopts kni_sockopts = {
+    .version        = SOCKOPT_VERSION,
+    .set_opt_min    = SOCKOPT_SET_KNI_ADD,
+    .set_opt_max    = SOCKOPT_SET_KNI_FLUSH,
+    .set            = kni_sockopt_set,
+    .get_opt_min    = SOCKOPT_GET_KNI_LIST,
+    .get_opt_max    = SOCKOPT_GET_KNI_LIST,
+    .get            = kni_sockopt_get,
+};
+
 int kni_init(void)
 {
-    int i;
-    char poolname[32];
+    if (!g_kni_enabled)
+        return EDPVS_OK;
 
-    for (i = 0; i < get_numa_nodes(); i++) {
-        memset(poolname, 0, sizeof(poolname));
-        snprintf(poolname, sizeof(poolname) - 1, "kni_mbuf_pool_%d", i);
+    if (rte_kni_init(NETIF_MAX_KNI) < 0)
+        rte_exit(EXIT_FAILURE, "rte_kni_init failed");
 
-        kni_mbuf_pool[i] = rte_pktmbuf_pool_create(poolname, KNI_MBUFPOOL_ELEMS,
-                KNI_MBUFPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, i);
-        if (!kni_mbuf_pool[i])
-            rte_exit(EXIT_FAILURE, "Fail to create pktmbuf_pool for kni.");
+    return EDPVS_OK;
+}
+
+int kni_ctrl_init(void)
+{
+    int err;
+
+    if (!g_kni_enabled)
+        return EDPVS_OK;
+
+    err = sockopt_register(&kni_sockopts);
+    if (err != EDPVS_OK) {
+        RTE_LOG(ERR, KNI, "%s: fail to register kni_sockopts -- %s\n",
+                __func__, dpvs_strerror(err));
+        return err;
+    }
+
+    return EDPVS_OK;
+}
+
+int kni_ctrl_term(void)
+{
+    int err;
+
+    if (!g_kni_enabled)
+        return EDPVS_OK;
+
+    err = sockopt_unregister(&kni_sockopts);
+    if (err != EDPVS_OK) {
+        RTE_LOG(ERR, KNI, "%s: fail to unregister kni_sockopts -- %s\n",
+                __func__, dpvs_strerror(err));
+        return err;
     }
 
     return EDPVS_OK;

@@ -187,6 +187,7 @@ static int __dpvs_timer_sched(struct timer_scheduler *sched,
         timer->delay = 1;
     }
 
+    timer->left = timer->delay;
     /* add to corresponding wheel, from higher level to lower. */
     for (level = LEVEL_DEPTH - 1; level >= 0; level--) {
         off = timer->delay / get_level_ticks(level);
@@ -196,6 +197,10 @@ static int __dpvs_timer_sched(struct timer_scheduler *sched,
 #ifdef CONFIG_TIMER_DEBUG
             assert(timer->handler == handler);
 #endif
+            /* store the remainder */
+            timer->left = timer->left % get_level_ticks(level);
+            for (level = level - 1; level >= 0; level--)
+                timer->left += sched->cursors[level] * get_level_ticks(level);
             return EDPVS_OK;
         }
     }
@@ -283,8 +288,9 @@ static inline void deviation_measure(void)
 static void rte_timer_tick_cb(struct rte_timer *tim, void *arg)
 {
     struct timer_scheduler *sched = arg;
-    struct dpvs_timer *timer, *next;
-    uint64_t left, hash, off, remainder;
+    struct dpvs_timer *timer;
+    struct list_head *head;
+    uint64_t hash, off;
     int level, lower;
     uint32_t *cursor;
     bool carry;
@@ -309,39 +315,38 @@ static void rte_timer_tick_cb(struct rte_timer *tim, void *arg)
             carry = true;
         }
 
-        list_for_each_entry_safe(timer, next,
-                                 &sched->hashs[level][*cursor], list) {
+        head = &sched->hashs[level][*cursor];
+        while (!list_empty(head)) {
+            timer = list_first_entry(head, struct dpvs_timer, list);
             /* is all lower levels ticks empty ? */
-            left = timer->delay % get_level_ticks(level);
-            if (!left) {
+            if (!timer->left) {
                 timer_expire(sched, timer);
             } else {
                 /* drop to lower level wheel, note it may not drop to
                  * "next" lower level wheel. */
                 list_del(&timer->list);
 
-                lower = level;
-                remainder = timer->delay % get_level_ticks(level);
-                while (--lower >= 0) {
-                    off = remainder / get_level_ticks(lower);
-                    if (!off)
-                        continue; /* next lower level */
-
-                    hash = (sched->cursors[lower] + off) % LEVEL_SIZE;
-                    list_add_tail(&timer->list, &sched->hashs[lower][hash]);
-                    break;
+                for (lower = level; lower >= 0; lower--) {
+                    off = timer->left / get_level_ticks(lower);
+                    if (off > 0) {
+                        hash = (sched->cursors[lower] + off) % LEVEL_SIZE;
+                        list_add_tail(&timer->list, &sched->hashs[lower][hash]);
+                        /*
+                         * store the remainder
+                         * all lower cursor must be 0
+                         * so it's not necessary to calculate the offset
+                         * see __dpvs_timer_sched for details
+                         */
+                        timer->left = timer->left % get_level_ticks(lower);
+                        break;
+                    }
                 }
-
-                assert(lower >= 0);
             }
         }
-
         if (!carry)
             break;
     }
     timer_sched_unlock(sched);
-
-    return;
 }
 
 static int timer_init_schedler(struct timer_scheduler *sched, lcoreid_t cid)
@@ -427,8 +432,8 @@ int dpvs_timer_init(void)
     int err;
 
     /* per-lcore timer */
-    rte_eal_mp_remote_launch(timer_lcore_init, NULL, SKIP_MASTER);
-    RTE_LCORE_FOREACH_SLAVE(cid) {
+    rte_eal_mp_remote_launch(timer_lcore_init, NULL, SKIP_MAIN);
+    RTE_LCORE_FOREACH_WORKER(cid) {
         err = rte_eal_wait_lcore(cid);
         if (err < 0) {
             RTE_LOG(ERR, DTIMER, "%s: lcore %d: %s.\n",
@@ -438,7 +443,7 @@ int dpvs_timer_init(void)
     }
 
     /* global timer */
-    return timer_init_schedler(&g_timer_sched, rte_get_master_lcore());
+    return timer_init_schedler(&g_timer_sched, rte_get_main_lcore());
 }
 
 int dpvs_timer_term(void)
@@ -447,8 +452,8 @@ int dpvs_timer_term(void)
     int err;
 
     /* per-lcore timer */
-    rte_eal_mp_remote_launch(timer_lcore_term, NULL, SKIP_MASTER);
-    RTE_LCORE_FOREACH_SLAVE(cid) {
+    rte_eal_mp_remote_launch(timer_lcore_term, NULL, SKIP_MAIN);
+    RTE_LCORE_FOREACH_WORKER(cid) {
         err = rte_eal_wait_lcore(cid);
         if (err < 0) {
             RTE_LOG(WARNING, DTIMER, "%s: lcore %d: %s.\n",
@@ -464,7 +469,7 @@ static inline struct timer_scheduler *this_lcore_sched(bool global)
 {
     /* any lcore (including master and slaves) can use global timer,
      * but only slave lcores can use per-lcore timer. */
-    if (!global && rte_lcore_id() == rte_get_master_lcore()) {
+    if (!global && rte_lcore_id() == rte_get_main_lcore()) {
         RTE_LOG(ERR, DTIMER, "try get per-lcore timer from master\n");
         return NULL;
     }

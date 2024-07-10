@@ -21,6 +21,8 @@ DPVS Tutorial
   - [KNI for virtual device](#vdev-kni)
 * [UDP Option of Address (UOA)](#uoa)
 * [Launch DPVS in Virtual Machine (Ubuntu)](#Ubuntu16.04)
+* [Traffic Control(TC)](#tc)
+* [Multiple Instances](#multi-instance)
 * [Debug DPVS](#debug)
   - [Debug with Log](#debug-with-log)
   - [Packet Capture and Tcpdump](#packet-capture)
@@ -430,9 +432,20 @@ virtual_server group 192.168.100.254-80 {
 }
 ```
 
-The keepalived config for backup is the same with Master, except the `state` should be 'BACKUP', and `priority` should be lower.
+The keepalived config for backup is the same with Master, except
+
+* local address is not the same with MASTER,
+* vrrp_instance `state` should be 'BACKUP',
+* vrrp_instance `priority` should be lower.
 
 ```
+local_address_group laddr_g1 {
+    192.168.100.202 dpdk0    # use DPDK interface
+    192.168.100.203 dpdk0    # use DPDK interface
+}
+
+... ...
+
 vrrp_instance VI_1 {
     state BACKUP
     priority 80
@@ -446,12 +459,19 @@ Start `keepalived` on both Master and Backup.
 ./keepalived -f /etc/keepalived/keepalived.conf
 ```
 
-For **test only**, add `VIP` and *routes* to DPDK interface manually on Master. Do not set VIP on both master and backup, in practice they should be added to keepalived configure file.
+Then, add *routes* to DPDK interface manually on both MASTER and BACKUP.
 
 ```bash
-./dpip addr add 192.168.100.254/32 dev dpdk0
 ./dpip route add 192.168.100.0/24 dev dpdk0
 ```
+Lastly, configure dpdk0.kni to make keepalived's vrrp and health-check work properly.
+
+```bash
+ip link set dpdk0.kni up
+ip addr add 192.168.100.28/24 dev dpdk0.kni               # assign an IP to dpdk0.kni
+dpip route add 192.168.100.28/32 scope kni_host dev dpdk0 # route packets target at 192.168.100.28 to dpdk0.kni
+```
+Note the dpdk0.kni's IP addresses should be different for MASTER and BACKUP.
 
 Check if parameters just set are correct:
 
@@ -464,7 +484,7 @@ TCP  192.168.100.254:80 rr
   -> 192.168.100.2:80             FullNat 100    0          0
   -> 192.168.100.3:80             FullNat 100    0          0
 
-$ ./dpip addr show
+$ ./dpip addr show -s
 inet 192.168.100.254/32 scope global dpdk0
      valid_lft forever preferred_lft forever
 inet 192.168.100.201/32 scope global dpdk0
@@ -473,8 +493,10 @@ inet 192.168.100.200/32 scope global dpdk0
      valid_lft forever preferred_lft forever sa_used 0 sa_free 1032176 sa_miss 0
 
 $ ./dpip route show
+inet 192.168.100.28/32 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope kni_host metric 0 proto auto
 inet 192.168.100.200/32 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope host metric 0 proto auto
 inet 192.168.100.201/32 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope host metric 0 proto auto
+inet 192.168.100.254/32 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope host metric 0 proto auto
 inet 192.168.100.0/24 via 0.0.0.0 src 0.0.0.0 dev dpdk0 mtu 1500 tos 0 scope link metric 0 proto auto
 
 $ ./ipvsadm  -G
@@ -491,7 +513,20 @@ client$ curl 192.168.100.254
 Your ip:port : 192.168.100.146:42394
 ```
 
-> We just explain how DPVS works with keepalived, and not verify if the master/backup feature provided by keepalived works. Please refer LVS docs if needed.
+> Note:
+> 1. We just explain how DPVS works with keepalived, and not verify if the master/backup feature provided by keepalived works. Please refer LVS docs if needed.
+> 2. Keepalived master/backup failover may fail if switch enabled the ARP broadcast suppression (unfortunately often is the case). If you don't want to change configurations of your switch, decrease the number of gratuitous ARP packets sent by keepalived (dpvs) on failover may help.
+
+```
+global_defs {
+    ... ...
+   vrrp_garp_master_repeat          1   # repeat counts for master state gratuitous arp
+   vrrp_garp_master_delay           1   # time to relaunch gratuitous arp after failover for master, in second
+   vrrp_garp_master_refresh         600 # time interval to refresh gratuitous arp periodically(0 = none), in second
+   vrrp_garp_master_refresh_repeat  1   # repeat counts to refresh gratuitous arp periodically
+   ... ...
+}
+```
 
 <a id='dr'/>
 
@@ -605,9 +640,9 @@ A strict limitation exists for DPVS NAT mode: **DPVS `NAT` mode can only work in
 * DPVS session entries are splited and distributed on lcores by RSS.
 * NAT forwarding requires both inbound and outbound traffic go through DPVS.
 * Only dest IP/port is translated in NAT forwarding, source IP/port is not changed.
-* Very limited maximum flow director rules can be set for a NIC.
+* Very limited maximum rte_flow rules can be set for a NIC.
 
-So, if no other control of the traffic flow, outbound packets may arrive at different lcore from inbound packets. If so, outbound packets would be dropped because session lookup miss. Full-NAT fixes the problem by using Flow Director(FDIR). However, there are very limited rules can be added for a NIC, i.e. 8K for XT-540. Unlike Full-NAT, NAT does not have local IP/port, so FDIR rules can only be set on source IP/port, which means only thousands concurrency is supported. Therefore, FDIR is not feasible for NAT.
+So, if no other control of the traffic flow, outbound packets may arrive at different lcore from inbound packets. If so, outbound packets would be dropped because session lookup miss. Full-NAT fixes the problem by using Flow Control (rte_flow). However, there are very limited rules can be added for a NIC, i.e. 8K for XT-540. Unlike Full-NAT, NAT does not have local IP/port, so flow rules can only be set on source IP/port, which means only thousands concurrency is supported. Therefore, rte_flow is not feasible for NAT.
 
 Whatever, we give a simple example for NAT mode. Remind it only works single lcore.
 
@@ -960,31 +995,28 @@ DPVS supports IPv6-IPv4 for fullnat, which means VIP/client IP can be IPv6 and l
 ```
 OSPF can just be configured like IPv6-IPv6. If you prefer keepalived, you can configure it like IPv6-IPv6 except real_server/local_address_group.
 
-**IPv6 and Flow Director**
+**IPv6 and Flow Control**
 
-We found there exists some NICs do not (fully) support Flow Director for IPv6.
-For example, 82599 10GE Controller do not support IPv6 *perfect mode*, and IPv4/IPv6 *signature mode* supports only one locall IP.
-
-If you would like to use Flow Director signature mode, add the following lines into the device configs of `dpvs.conf`:
+We found there exists some NICs do not (fully) support Flow Control of IPv6 required by IPv6.
+For example, the rte_flow of 82599 10GE Controller (ixgbe PMD) relies on an old fashion flow type `flow director` (fdir), which doesn't support IPv6 in its *perfect mode*, and support only one local IPv4 or IPv6 in its *signature mode*. DPVS supports the fdir mode config for compatibility.
 
 ```
-fdir {
+netif_defs {
+    ...
     mode                signature
-    pballoc             64k
-    status              matched
 }
 ```
 
-Another method to avoid Flow Director problem is to use the redirect forwarding, which forwards the recieved packets to the right lcore where the session resides by using lockless DPDK rings.
+Another method to avoid not (fully) supported rte_flow problem is to use the redirect forwarding, which forwards the recieved packets to the correct worker lcore where the session resides by using lockless DPDK rings.
 If you want to try this method, turn on the `redirect` switch in the `dpvs.conf`.
 
 ```
 ipvs_defs {
     conn {
-        ......
+        ...
         redirect    on
     }
-    ......
+    ...
 }
 ```
 It should note that the redirect forwarding may harm performance to a certain degree. Keep it in `off` state unless you have no other solutions.
@@ -1056,7 +1088,7 @@ Please also check `dpip tunnel help` for details.
 > Notes:
 > 1. RSS schedule all packets to same queue/CPU since underlay source IP may the same.
 >    If one lcore's `sa_pool` gets full, `sa_miss` happens. This is not a problem for some NICs which support inner RSS for tunnelling.
-> 2. `fdir`/`rss` won't works well on tunnel deivce, do not use tunnel for FNAT.
+> 2. `rte_flow`/`rss` won't works well on tunnel deivce, do not use tunnel for FNAT.
 
 <a id='vdev-kni'/>
 
@@ -1127,7 +1159,7 @@ Now, `dpvs.conf` must be put at `/etc/dpvs.conf`, just copy it from `conf/dpvs.c
 $ cp conf/dpvs.conf.single-nic.sample /etc/dpvs.conf
 ```
 
-The NIC for Ubuntu may not support flow-director(fdir),for that case ,please use 'single worker',may decrease conn_pool_size .
+The NIC for Ubuntu may not support flow control(rte_flow) required by DPVS. For that case, please use 'single worker', and disable flow control.
 
 ```bash
 queue_number        1
@@ -1149,6 +1181,120 @@ worker_defs {
         }
     }
 
+    sa_pool {
+        flow_enable      off
+    }
+```
+
+<a id='tc'/>
+
+# Traffic Control(TC)
+
+Please refer to doc [tc.md](tc.md).
+
+<a id='multi-instance'/>
+
+# Multiple Instances
+
+Generally, DPVS is a network process running on physical server which is usually equipped with dozens of CPUs and vast sufficient memory. DPVS is CPU/memory efficient, so the CPU/memory resources on a general physical server are usually far from fully used. Thus we may hope to run multiple independent DPVS instances on a server to make the most out of it. A DPVS instance may use 1~4 NIC ports, depending on if the ports are bonding and the network topology of two-arm or one-arm. Extra NICs are needed if we want to run multiple DPVS instances because one NIC port should be managed only by one DPVS instance. Now let's make insights into the details of multiple DPVS instances.
+
+#### CPU Isolation
+
+The CPUs used by DPVS are always busy loop. If a CPU is assigned to two DPVS instances simultaneously, then both instances are to suffer from dramatic processing delay. So different instances must run on different CPUs, which is achieved by the procedures below.
+
+- Start DPVS with EAL options `-l CORELIST` or `--lcores COREMAP` or `-c COREMASK` to specify on which CPUs the instance is to run. 
+- Configure corresponding CPUs into DPVS config file (config key: worker_defs/worker */cpu_id).
+
+It's suggested we select the CPUs and NIC ports on the same numa node on numa-aware platform. Performance degrades if the NIC ports and CPUs of a DPVS instance are on different numa nodes.
+
+#### Memory Isolation
+
+As is known, DPVS takes advantage of hugepage memory. The hugepage memory of different DPVS instances can be isolated by using different memory mapping files. The DPDK EAL option `--file-prefix` specifies the name prefix of memory mapping file. Thus multiple DPVS instances can run simultaneously by specifying unique name prefixes of hugepage memory with this EAL option.
+
+#### Process Isolation
+
+* DPVS Process Isolation
+
+Every DPVS instance must have an unique PID file, a config file, and an IPC socket file, which are specified by the following DPVS options respectively.
+
+    -p, --pid-file FILE
+    -c, --conf FILE
+    -x, --ipc-file FILE
+
+For example, 
+
+```sh
+./bin/dpvs -c /etc/dpvs1.conf -p /var/run/dpvs1.pid -x /var/run/dpvs1.ipc -- --file-prefix=dpvs1 -a 0000:4b:00.0 -a 0000:4b:00.1 -l 0-8 --main-lcore 0
+```
+
+* Keepalived Process Isolation
+
+One DPVS instance corresponds to one keepalived instance, and vice versa. Similarly, different keepalived processes must have unique config files and PID files. Note that depending on the configurations, keepalived for DPVS may consist of 3 daemon processes, i.e, the main process, the health check subprocess, and the vrrp subprocess. The config files and PID files for different keepalived instances can be specified by the following options, respectively.
+
+    -f, --use-file=FILE
+    -p, --pid=FILE
+    -c, --checkers_pid=FILE
+    -r, --vrrp_pid=FILE
+
+For example,
+
+```sh
+./bin/keepalived -D -f etc/keepalived/keepalived1.conf --pid=/var/run/keepalived1.pid --vrrp_pid=/var/run/vrrp1.pid --checkers_pid=/var/run/checkers1.pid
+```
+
+#### Talk to different DPVS instances with dpip/ipvsadm
+
+`Dpip` and `ipvsadm` are the utility tools used to configure DPVS. By default, they works well on the single DPVS instance server without any extra settings. But on the multiple DPVS instance server, an envrionment variable `DPVS_IPC_FILE` should be preset as the DPVS's IPC socket file to which ipvsadm/dpip wants to talk. Refer to the the previous part "DPVS Process Isolation" for how to specify different IPC socket files for multiple DPVS instances. For example,
+
+```sh
+DPVS_IPC_FILE=/var/run/dpvs1.ipc ipvsadm -ln
+# or equivalently,
+export DPVS_IPC_FILE=/var/run/dpvs1.ipc
+ipvsadm -ln
+```
+
+#### NIC Ports, KNI and Routes
+
+The multiple DPVS instances running on a server are independent, that is DPVS adopts the deployment model [Running Multiple Independent DPDK Applications](https://doc.dpdk.org/guides/prog_guide/multi_proc_support.html#running-multiple-independent-dpdk-applications), which requires the instances cannot share any NIC ports. We can use the EAL options "-a, --allow" or "-b, --block" to allow/disable the NIC ports for a DPVS instance. However, Linux KNI kernel module only supports one DPVS instance in a specific network namespace (refer to [kernel/linux/kni/kni_misc.c](https://github.com/DPDK/dpdk/tree/main/kernel/linux/kni)). Basically, DPVS provides two solutions to the problem.
+
+* Solution 1: Disable KNI on all other DPVS instances except the first one. A global config item `kni` has been added to DPVS since now. 
+
+```
+# dpvs.conf
+global_defs {
+    ...
+    <init> kni                  on                  <default on, on|off>
+    ...
+}
+```
+
+* Solution 2: Run DPVS instances in different network namespaces. It also resolves the route conflicts for multiple KNI network ports of different DPVS instances. A typical procedure to run a DPVS instance in a network namespace is shown below.
+
+Firstly, create a new network namespace, "dpvsns" for example.
+
+```sh
+/usr/sbin/ip netns add dpvsns
+```
+Secondly, move the NIC ports for this DPVS instance to the newly created network namespace.
+
+```sh
+/usr/sbin/ip link set eth1 netns dpvsns
+/usr/sbin/ip link set eth2 netns dpvsns
+/usr/sbin/ip link set eth3 netns dpvsns
+```
+Lastly, start DPVS and all its related processes (such as keepalived, routing daemon) in the network namespace.
+
+```sh
+/usr/sbin/ip netns exec dpvsns ./bin/dpvs -c /etc/dpvs2.conf -p /var/run/dpvs2.pid -x /var/run/dpvs2.ipc -- --file-prefix=dpvs2 -a 0000:cb:00.1 -a 0000:ca:00.0 -a 0000:ca:00.1 -l 12-20 --main-lcore 12
+/usr/sbin/ip netns exec dpvsns ./bin/keepalived -D --pid=/var/run/keepalived2.pid --vrrp_pid=/var/run/vrrp2.pid --checkers_pid=/var/run/checkers2.pid -f etc/keepalived/keepalived2.conf
+/usr/sbin/ip netns exec dpvsns /usr/sbin/bird -f -c /etc/bird2.conf -s /var/run/bird2/bird.ctl
+...
+```
+
+For performance improvement, we can enable multiple kthread mode when multiple DPVS instances are deployed on a server. In this mode, each KNI port is processed by a dedicated kthread rather than a shared kthread.
+
+```sh
+insmod rte_kni.ko kthread_mode=multiple carrier=on
 ```
 
 <a id='debug'/>
@@ -1180,7 +1326,7 @@ Firstly, DPVS runs with `WARNING` log level by default. You can change it in `/e
 
 Use low level log such as "INFO" or "DEBUG" may help find more clues to your problem.
 
-Secondly, some modules support more detailed debug log only if you enable it when compile DPVS. The supported flags are defined but commented in [src/config.mk](../src/config.mk), some of which are listed below. Uncomment it and recompile DPVS if you need to debug the corresponding module.
+Secondly, some modules support more detailed debug log only if you enable it when compile DPVS. The modular debug options are available in [config.mk](../config.mk), some of which are listed below. Change the value to "y" and recompile DPVS if you want to debug a module.
 
 ```
 - CONFIG_DPVS_IPVS_DEBUG    # for ipvs forwarding debug
@@ -1321,7 +1467,7 @@ $
 
 ### dpdk-pdump
 
-The `dpdk-pdump` runs as a DPDK secondary process and is capable of enabling packet capture on dpdk ports. DPVS works as the primary process for dpdk-pdump, which shoud enable the packet capture framework by setting `global_defs/pdump` to be `on` in `/etc/dpvs.conf` when DPVS starts up. 
+The `dpdk-pdump` runs as a DPDK secondary process and is capable of enabling packet capture on dpdk ports. DPVS works as the primary process for dpdk-pdump, which should enable the packet capture framework by setting `global_defs/pdump` to be `on` in `/etc/dpvs.conf` when DPVS starts up. 
 
 Refer to [dpdk-pdump doc](https://doc.dpdk.org/guides/tools/pdump.html) for its usage. DPVS extends dpdk-pdump with a [DPDK patch](../patch/dpdk-stable-18.11.2/0005-enable-pdump-and-change-dpdk-pdump-tool-for-dpvs.patch) to add some packet filtering features. Run `dpdk-pdump  -- --help` to find all supported pdump params.
 

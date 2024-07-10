@@ -20,6 +20,7 @@
 
 #include "global_data.h"
 #include "conf/common.h"
+#include "conf/sockopts.h"
 #include "list.h"
 #include "dpdk.h"
 
@@ -195,22 +196,28 @@ int msg_dump(const struct dpvs_msg *msg, char *buf, int len);
 #define MSG_TYPE_BLKLST_ADD                 9
 #define MSG_TYPE_BLKLST_DEL                 10
 #define MSG_TYPE_STATS_GET                  11
-#define MSG_TYPE_TC_STATS                   13
 #define MSG_TYPE_CONN_GET                   14
 #define MSG_TYPE_CONN_GET_ALL               15
 #define MSG_TYPE_IPV6_STATS                 16
 #define MSG_TYPE_ROUTE6                     17
 #define MSG_TYPE_NEIGH_GET                  18
-#define MSG_TYPE_IPSET_ADD                  19
-#define MSG_TYPE_IPSET_DEL                  20
-#define MSG_TYPE_IPSET_FLUSH                21
 #define MSG_TYPE_IFA_GET                    22
 #define MSG_TYPE_IFA_SET                    23
 #define MSG_TYPE_IFA_SYNC                   24
+#define MSG_TYPE_WHTLST_ADD                 25
+#define MSG_TYPE_WHTLST_DEL                 26
+#define MSG_TYPE_TC_QSCH_GET                27
+#define MSG_TYPE_TC_QSCH_SET                28
+#define MSG_TYPE_TC_CLS_GET                 29
+#define MSG_TYPE_TC_CLS_SET                 30
+#define MSG_TYPE_IPSET_SET                  40
+#define MSG_TYPE_DEST_CHECK_NOTIFY_MASTER   41
+#define MSG_TYPE_DEST_CHECK_NOTIFY_SLAVES   42
+#define MSG_TYPE_IPVS_RANGE_START           100
 
 /* for svc per_core, refer to service.h*/
 enum {
-    MSG_TYPE_SVC_SET_FLUSH = MSG_TYPE_IFA_SYNC + 1,
+    MSG_TYPE_SVC_SET_FLUSH = MSG_TYPE_IPVS_RANGE_START,
     MSG_TYPE_SVC_SET_ZERO,
     MSG_TYPE_SVC_SET_ADD,
     MSG_TYPE_SVC_SET_EDIT,
@@ -226,7 +233,17 @@ enum {
     MSG_TYPE_SVC_GET_SERVICE,
     MSG_TYPE_SVC_GET_DESTS,
     MSG_TYPE_LADDR_GET_ALL,
+#ifdef CONFIG_DPVS_AGENT
+    MSG_TYPE_AGENT_GET_DESTS,
+    MSG_TYPE_AGENT_GET_LADDR,
+    MSG_TYPE_AGENT_ADD_LADDR,
+    MSG_TYPE_AGENT_DEL_LADDR,
+    MSG_TYPE_AGENT_ADD_DESTS,
+    MSG_TYPE_AGENT_EDIT_DESTS,
+    MSG_TYPE_AGENT_DEL_DESTS,
+#endif
 };
+
 #define MSG_TYPE_SVC_SET_BASE MSG_TYPE_SVC_SET_FLUSH
 #define MSG_TYPE_SVC_GET_BASE MSG_TYPE_SVC_GET_INFO
 #define MSG_TYPE_SET_LADDR_BASE MSG_TYPE_LADDR_SET_ADD

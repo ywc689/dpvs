@@ -89,6 +89,7 @@ static inline const char *inet_proto_name(uint8_t proto)
     const static char *proto_names[256] = {
         [IPPROTO_TCP]     = "TCP",
         [IPPROTO_UDP]     = "UDP",
+        [IPPROTO_SCTP]    = "SCTP",
         [IPPROTO_ICMP]    = "ICMP",
         [IPPROTO_ICMPV6]  = "ICMPV6",
     };
@@ -159,6 +160,7 @@ static inline int inet_addr_range_parse(const char *param,
         port1 = port2 = NULL;
     }
 
+    *af = 0;
     memset(range, 0, sizeof(*range));
 
     if (strlen(ip1) && inet_pton(AF_INET6, ip1, &range->min_addr.in6) > 0) {

@@ -20,34 +20,35 @@
 #include <rte_errno.h>
 #include <rte_eal_memconfig.h>
 #include <rte_malloc.h>
+#include <rte_tailq.h>
 #include "conf/eal_mem.h"
 #include "eal_mem.h"
 #include "ctrl.h"
 
 #if RTE_VERSION >= RTE_VERSION_NUM(18, 11, 0, 0)
 #define MAX_SEGMENT_NUM         (512)
+static uint64_t s_all_socket_heap_freesz[RTE_MAX_NUMA_NODES];
 #else
 #define MAX_SEGMENT_NUM         RTE_MAX_MEMSEG
 #endif
 #define MAX_MEMZONE_NUM         RTE_MAX_MEMZONE
 
-static uint64_t eal_get_free_seg_len(int socket_id)
+#if RTE_VERSION >= RTE_VERSION_NUM(18, 11, 0, 0)
+static int dp_vs_get_all_socket_heap_freesz_stats(void)
 {
-    uint64_t len = 0;
+    int i;
     struct rte_malloc_socket_stats socket_stats;
 
-    if (socket_id < 0 || socket_id > RTE_MAX_NUMA_NODES)
-        return 0;
-
-    memset(&socket_stats, 0, sizeof(struct rte_malloc_socket_stats));
-    if (rte_malloc_get_socket_stats(socket_id, &socket_stats) != 0)
-        return 0;
-    len = socket_stats.heap_freesz_bytes;
-
-    return len;
+    for (i = 0; i < RTE_MAX_NUMA_NODES; i++) {
+        s_all_socket_heap_freesz[i] = 0;
+        if (rte_malloc_get_socket_stats(i, &socket_stats) != 0) {
+            break;
+        }
+        s_all_socket_heap_freesz[i] = socket_stats.heap_freesz_bytes;
+    }
+    return 0;
 }
 
-#if RTE_VERSION >= RTE_VERSION_NUM(18, 11, 0, 0)
 static int dp_vs_fill_mem_seg_info(const struct rte_memseg_list *msl, const struct rte_memseg *ms,
             void *arg)
 {
@@ -60,14 +61,14 @@ static int dp_vs_fill_mem_seg_info(const struct rte_memseg_list *msl, const stru
     seg_ret = &eal_mem_segs->seg_info[eal_mem_segs->seg_num];
     eal_mem_segs->seg_num++;
 
-    seg_ret->phys_addr = ms->phys_addr;
+    seg_ret->iova = ms->iova;
     seg_ret->virt_addr = ms->addr_64;
     seg_ret->len = ms->len;
     seg_ret->hugepage_sz = ms->hugepage_sz;
     seg_ret->socket_id = ms->socket_id;
     seg_ret->nchannel = ms->nchannel;
     seg_ret->nrank = ms->nrank;
-    seg_ret->free_seg_len = eal_get_free_seg_len(ms->socket_id);
+    seg_ret->free_seg_len = s_all_socket_heap_freesz[ms->socket_id];
 
     return 0;
 }
@@ -84,17 +85,34 @@ static void dp_vs_fill_mem_zone_info(const struct rte_memzone *mz, void *arg)
     eal_mem_zones->zone_num++;
 
     memcpy(zone_ret->name, mz->name, EAL_MEM_NAME_LEN);
-    zone_ret->phys_addr = mz->phys_addr;
+    zone_ret->iova = mz->iova;
     zone_ret->virt_addr = mz->addr_64;
     zone_ret->len = mz->len;
     zone_ret->hugepage_sz = mz->hugepage_sz;
     zone_ret->socket_id = mz->socket_id;
+}
+#else
+static uint64_t eal_get_free_seg_len(int socket_id)
+{
+    uint64_t len = 0;
+    struct rte_malloc_socket_stats socket_stats;
+
+    if (socket_id < 0 || socket_id > RTE_MAX_NUMA_NODES)
+        return 0;
+
+    memset(&socket_stats, 0, sizeof(struct rte_malloc_socket_stats));
+    if (rte_malloc_get_socket_stats(socket_id, &socket_stats) != 0)
+        return 0;
+    len = socket_stats.heap_freesz_bytes;
+
+    return len;
 }
 #endif
 
 static int dp_vs_get_eal_mem_seg(eal_all_mem_seg_ret_t *eal_mem_segs)
 {
 #if RTE_VERSION >= RTE_VERSION_NUM(18, 11, 0, 0)
+    dp_vs_get_all_socket_heap_freesz_stats();
     rte_memseg_walk(dp_vs_fill_mem_seg_info, eal_mem_segs);
 #else
     const struct rte_mem_config *mcfg;
@@ -110,7 +128,7 @@ static int dp_vs_get_eal_mem_seg(eal_all_mem_seg_ret_t *eal_mem_segs)
         }
         seg_ret = &eal_mem_segs->seg_info[eal_mem_segs->seg_num];
         eal_mem_segs->seg_num++;
-        seg_ret->phys_addr = mcfg->memseg[i].phys_addr;
+        seg_ret->iova = mcfg->memseg[i].iova;
         seg_ret->virt_addr = mcfg->memseg[i].addr_64;
         seg_ret->len = mcfg->memseg[i].len;
         seg_ret->hugepage_sz = mcfg->memseg[i].hugepage_sz;
@@ -171,7 +189,7 @@ static int dp_vs_get_eal_mem_pool(eal_all_mem_pool_ret_t *eal_mem_pools)
     if (NULL == mempool_list)
         return -1;
 
-    rte_rwlock_read_lock(RTE_EAL_MEMPOOL_RWLOCK);
+    rte_mcfg_mempool_read_lock();
     eal_mem_pools->mempool_num = 0;
     TAILQ_FOREACH(te, mempool_list, next) {
         mp = (struct rte_mempool *) te->data;
@@ -186,7 +204,7 @@ static int dp_vs_get_eal_mem_pool(eal_all_mem_pool_ret_t *eal_mem_pools)
         mempool_ret->trailer_size = mp->trailer_size;
         mempool_ret->private_data_size = mp->private_data_size;
     }
-    rte_rwlock_read_unlock(RTE_EAL_MEMPOOL_RWLOCK);
+    rte_mcfg_mempool_read_unlock();
 
     return 0;
 }
@@ -201,7 +219,7 @@ static int dp_vs_get_eal_mem_ring(eal_all_mem_ring_ret_t *eal_mem_rings)
 
     ring_list = RTE_TAILQ_LOOKUP("RTE_RING", rte_ring_list);
 
-    rte_rwlock_read_lock(RTE_EAL_TAILQ_RWLOCK);
+    rte_mcfg_tailq_read_lock();
     eal_mem_rings->ring_num = 0;
     TAILQ_FOREACH(te, ring_list, next) {
         r = (struct rte_ring *)te->data;
@@ -217,7 +235,7 @@ static int dp_vs_get_eal_mem_ring(eal_all_mem_ring_ret_t *eal_mem_rings)
         ring_ret->used = rte_ring_count(r);
         ring_ret->avail = rte_ring_free_count(r);
     }
-    rte_rwlock_read_unlock(RTE_EAL_TAILQ_RWLOCK);
+    rte_mcfg_tailq_read_unlock();
 
     return 0;
 }

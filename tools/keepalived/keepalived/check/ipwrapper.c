@@ -38,6 +38,33 @@
 #include "check_daemon.h"
 
 static bool __attribute((pure))
+vs_iseq(const virtual_server_t *vs_a, const virtual_server_t *vs_b)
+{
+	if (!vs_a->vsgname != !vs_b->vsgname)
+		return false;
+
+	if (vs_a->vsgname) {
+		/* Should we check the vsg entries match? */
+		if (inet_sockaddrport(&vs_a->addr) != inet_sockaddrport(&vs_b->addr))
+			return false;
+		if (vs_a->service_type != vs_b->service_type)
+			return false;
+		return !strcmp(vs_a->vsgname, vs_b->vsgname);
+	} else if (vs_a->af != vs_b->af)
+		return false;
+	else if (vs_a->vfwmark) {
+		if (vs_a->vfwmark != vs_b->vfwmark)
+			return false;
+	} else {
+		if (vs_a->service_type != vs_b->service_type ||
+		    !sockstorage_equal(&vs_a->addr, &vs_b->addr))
+			return false;
+	}
+
+	return true;
+}
+
+static bool __attribute((pure))
 vsge_iseq(const virtual_server_group_entry_t *vsge_a, const virtual_server_group_entry_t *vsge_b)
 {
 	if (vsge_a->is_fwmark != vsge_b->is_fwmark)
@@ -53,13 +80,11 @@ vsge_iseq(const virtual_server_group_entry_t *vsge_a, const virtual_server_group
 	return true;
 }
 
-#if 0
 static bool __attribute((pure))
 rs_iseq(const real_server_t *rs_a, const real_server_t *rs_b)
 {
 	return sockstorage_equal(&rs_a->addr, &rs_b->addr);
 }
-#endif
 
 /* Returns the sum of all alive RS weight in a virtual server. */
 static unsigned long __attribute__ ((pure))
@@ -303,20 +328,40 @@ clear_service_vs(virtual_server_t * vs, bool stopping)
 	UNSET_ALIVE(vs);
 }
 
+static void
+clear_laddr_group(local_addr_group *laddr_group, virtual_server_t *vs)
+{
+	element e;
+	local_addr_entry *laddr_entry;
+
+	if (!laddr_group)
+		return;
+
+	LIST_FOREACH(laddr_group->addr_ip, laddr_entry, e) {
+		if (!ipvs_laddr_remove_entry(vs, laddr_entry))
+			return;
+	}
+	LIST_FOREACH(laddr_group->range, laddr_entry, e) {
+		if (!ipvs_laddr_remove_entry(vs, laddr_entry))
+			return;
+	}
+}
+
 /* IPVS cleaner processing */
 void
 clear_services(void)
 {
-	if (!check_data)
-		return;
-
 	element e;
 	virtual_server_t *vs;
+	local_addr_group *laddr_group;
 
 	if (!check_data || !check_data->vs)
 		return;
 
 	LIST_FOREACH(check_data->vs, vs, e) {
+		laddr_group = ipvs_get_laddr_group_by_name(vs->local_addr_gname,
+										check_data->laddr_group);
+		clear_laddr_group(laddr_group, vs);
 		/* Remove the real servers, and clear the vs unless it is
 		 * using a VS group and it is not the last vs of the same
 		 * protocol or address family using the group. */
@@ -324,7 +369,6 @@ clear_services(void)
 	}
 }
 
-/* Set a realserver IPVS rules */
 static bool
 init_service_rs(virtual_server_t * vs)
 {
@@ -599,7 +643,10 @@ init_service_vs(virtual_server_t * vs)
 		if (!ipvs_cmd(LVS_CMD_ADD_BLKLST, vs, NULL))
 			return 0;
 	}
-
+    if (vs->whtlst_addr_gname) {
+		if (!ipvs_cmd(LVS_CMD_ADD_WHTLST, vs, NULL))
+			return 0;
+	}
 	/* Processing real server queue */
 	if (!init_service_rs(vs))
 		return false;
@@ -814,7 +861,7 @@ vs_exist(virtual_server_t * old_vs)
 	virtual_server_t *vs;
 
 	LIST_FOREACH(check_data->vs, vs, e) {
-		if (VS_ISEQ(old_vs, vs))
+		if (vs_iseq(old_vs, vs))
 			return vs;
 	}
 
@@ -832,7 +879,7 @@ rs_exist(real_server_t * old_rs, list l)
 		return NULL;
 
 	LIST_FOREACH(l, rs, e) {
-		if (RS_ISEQ(rs, old_rs))
+		if (rs_iseq(rs, old_rs))
 			return rs;
 	}
 
@@ -957,7 +1004,11 @@ clear_diff_rs(virtual_server_t *old_vs, virtual_server_t *new_vs, list old_check
 			migrate_checkers(new_vs, rs, new_rs, old_checkers_queue);
 
 			/* Do we need to update the RS configuration? */
-			if (false ||
+			/* RS without inhibit flag may already be deleted by keepalived because
+			 * of failed healthcheck, we only edit rs if rs exists in dpvs at reload.
+			 * When RS without inhibit flag becomes alive , keepalived will re-adds it in dpvs.
+			 */
+			if (new_rs->set && (false ||
 #ifdef _HAVE_IPVS_TUN_TYPE_
 			    rs->tun_type != new_rs->tun_type ||
 			    rs->tun_port != new_rs->tun_port ||
@@ -965,11 +1016,20 @@ clear_diff_rs(virtual_server_t *old_vs, virtual_server_t *new_vs, list old_check
 			    rs->tun_flags != new_rs->tun_flags ||
 #endif
 #endif
-			    rs->forwarding_method != new_rs->forwarding_method)
+			    rs->forwarding_method != new_rs->forwarding_method||
+				/* no need to check rs weight, because rs weight will be updated by init_service_rs */
+				rs->u_threshold != new_rs->u_threshold ||
+				rs->l_threshold != new_rs->l_threshold))
 				ipvs_cmd(LVS_CMD_EDIT_DEST, new_vs, new_rs);
 		}
 	}
 	clear_service_rs(old_vs, rs_to_remove, false);
+
+	//keep new_vs quorum_state_up same with old_vs
+	if (old_vs->quorum_state_up != new_vs->quorum_state_up) {
+		new_vs->quorum_state_up = old_vs->quorum_state_up;
+	}
+
 	free_list(&rs_to_remove);
 }
 
@@ -1046,9 +1106,24 @@ clear_diff_laddr_entry(list old, list new, virtual_server_t * old_vs)
 	return 1;
 }
 
+/* clear all local address entry of the vs */
+static int
+clear_all_laddr_entry(list l, virtual_server_t * vs)
+{
+	element e;
+	local_addr_entry *laddr_entry;
+
+	LIST_FOREACH(l, laddr_entry, e) {
+		if (!ipvs_laddr_remove_entry(vs, laddr_entry))
+			return 0;
+	}
+
+	return 1;
+}
+
 /* Clear the diff local address of the old vs */
 static int
-clear_diff_laddr(virtual_server_t * old_vs)
+clear_diff_laddr(virtual_server_t * old_vs, virtual_server_t * new_vs)
 {
 	local_addr_group *old;
 	local_addr_group *new;
@@ -1057,15 +1132,27 @@ clear_diff_laddr(virtual_server_t * old_vs)
  	 *  If old vs was not in fulllnat mod or didn't own local address group, 
  	 * then do nothing and return 
  	 */
+	/*Fixme: Can we change laddr of vs in SNAT mode ?*/
 	if ((old_vs->forwarding_method != IP_VS_CONN_F_FULLNAT) || 
 						!old_vs->local_addr_gname)
 		return 1;
+	else
+		/* Fetch old_vs local address group */
+		old = ipvs_get_laddr_group_by_name(old_vs->local_addr_gname, 
+								old_check_data->laddr_group);
 
-	/* Fetch local address group */
-	old = ipvs_get_laddr_group_by_name(old_vs->local_addr_gname, 
-							old_check_data->laddr_group);
-	new = ipvs_get_laddr_group_by_name(old_vs->local_addr_gname, 
-							check_data->laddr_group);
+	/* if new_vs has no local address group, delete all local address from old_vs */ 
+	if (!new_vs->local_addr_gname) {
+		if (!clear_all_laddr_entry(old->addr_ip, old_vs))
+			return 0;
+		if (!clear_all_laddr_entry(old->range, old_vs))
+			return 0;
+		return 1;
+	}
+	else
+		/* Fetch new_vs local address group */
+	    new = ipvs_get_laddr_group_by_name(new_vs->local_addr_gname,
+								check_data->laddr_group);
 
 	if (!clear_diff_laddr_entry(old->addr_ip, new->addr_ip, old_vs))
 		return 0;
@@ -1112,12 +1199,27 @@ clear_diff_blklst_entry(list old, list new, virtual_server_t * old_vs)
 	return 1;
 }
 
+/* clear all blacklist address entry of the vs */
+static int
+clear_all_blklst_entry(list l, virtual_server_t * vs)
+{
+	element e;
+	blklst_addr_entry *blklst_entry;
+
+	LIST_FOREACH(l, blklst_entry, e) {
+		if (!ipvs_blklst_remove_entry(vs, blklst_entry))
+			return 0;
+	}
+
+	return 1;
+}
+
 /* Clear the diff blacklist address of the old vs */
 static int
-clear_diff_blklst(virtual_server_t * old_vs)
+clear_diff_blklst(virtual_server_t * old_vs, virtual_server_t * new_vs)
 {
-	blklst_addr_group *old;
-	blklst_addr_group *new;
+	blklst_addr_group *old = NULL;
+	blklst_addr_group *new = NULL;
 
 	/*
 	 *  If old vs  didn't own blacklist address group, 
@@ -1125,12 +1227,27 @@ clear_diff_blklst(virtual_server_t * old_vs)
 	 */
 	if (!old_vs->blklst_addr_gname)
 		return 1;
+	else
+	    /* Fetch old_vs blacklist address group */
+		old = ipvs_get_blklst_group_by_name(old_vs->blklst_addr_gname,
+								old_check_data->blklst_group);
+	if (!old)
+		return 1;
 
-	/* Fetch blacklist address group */
-	old = ipvs_get_blklst_group_by_name(old_vs->blklst_addr_gname,
-							old_check_data->blklst_group);
-	new = ipvs_get_blklst_group_by_name(old_vs->blklst_addr_gname,
-							check_data->blklst_group);
+	/* if new_vs has no blacklist group, delete all blklst address from old_vs */ 
+	if (!new_vs->blklst_addr_gname) {
+		if (!clear_all_blklst_entry(old->addr_ip, old_vs))
+			return 0;
+		if (!clear_all_blklst_entry(old->range, old_vs))
+			return 0;
+		return 1;
+	}
+	else
+		/* Fetch new_vs blacklist address group */
+	    new = ipvs_get_blklst_group_by_name(new_vs->blklst_addr_gname,
+								check_data->blklst_group);
+	if (!new)
+		return 1;
 
 	if (!clear_diff_blklst_entry(old->addr_ip, new->addr_ip, old_vs))
 		return 0;
@@ -1138,6 +1255,102 @@ clear_diff_blklst(virtual_server_t * old_vs)
 		return 0;
 
 	return 1;
+}
+
+/* Check if a whitelist address entry is in list */
+static int
+whtlst_entry_exist(whtlst_addr_entry *whtlst_entry, list l)
+{
+    element e;
+    whtlst_addr_entry *entry;
+
+    for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+        entry = ELEMENT_DATA(e);
+        if (sockstorage_equal(&entry->addr, &whtlst_entry->addr) &&
+            entry->range == whtlst_entry->range)
+            return 1;
+    }
+    return 0;
+}
+
+/* Clear the diff whtlst address entry of the old vs */
+static int
+clear_diff_whtlst_entry(list old, list new, virtual_server_t * old_vs)
+{
+    element e;
+    whtlst_addr_entry *whtlst_entry;
+
+    for (e = LIST_HEAD(old); e; ELEMENT_NEXT(e)) {
+        whtlst_entry = ELEMENT_DATA(e);
+        if (!whtlst_entry_exist(whtlst_entry, new)) {
+            log_message(LOG_INFO, "VS [%s-%d] in whitelist address group %s no longer exist\n"
+                    , inet_sockaddrtos(&whtlst_entry->addr)
+                    , whtlst_entry->range
+                    , old_vs->whtlst_addr_gname);
+
+            if (!ipvs_whtlst_remove_entry(old_vs, whtlst_entry))
+                return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* clear all whitelist address entry of the vs */
+static int
+clear_all_whtlst_entry(list l, virtual_server_t * vs)
+{
+	element e;
+	whtlst_addr_entry *whtlst_entry;
+
+	LIST_FOREACH(l, whtlst_entry, e) {
+		if (!ipvs_whtlst_remove_entry(vs, whtlst_entry))
+			return 0;
+	}
+
+	return 1;
+}
+
+/* Clear the diff whitelist address of the old vs */
+static int
+clear_diff_whtlst(virtual_server_t * old_vs, virtual_server_t * new_vs)
+{
+    whtlst_addr_group *old = NULL;
+    whtlst_addr_group *new = NULL;
+    /*
+     *  If old vs  didn't own whitelist address group,
+     * then do nothing and return
+     */
+    if (!old_vs->whtlst_addr_gname)
+        return 1;
+	else
+    	/* Fetch whitelist address group */
+    	old = ipvs_get_whtlst_group_by_name(old_vs->whtlst_addr_gname,
+                                old_check_data->whtlst_group);
+
+	if (!old)
+		return 1;
+	/* if new_vs has no whitelist group, delete all whtlst address from old_vs */ 
+	if (!new_vs->whtlst_addr_gname) {
+		if (!clear_all_whtlst_entry(old->addr_ip, old_vs))
+			return 0;
+		if (!clear_all_whtlst_entry(old->range, old_vs))
+			return 0;
+		return 1;
+	}
+	else
+		/* Fetch new_vs whitelist address group */
+	    new = ipvs_get_whtlst_group_by_name(new_vs->whtlst_addr_gname,
+								check_data->whtlst_group);
+
+	if (!new)
+		return 1;
+    if (!clear_diff_whtlst_entry(old->addr_ip, new->addr_ip, old_vs))
+        return 0;
+    if (!clear_diff_whtlst_entry(old->range, new->range, old_vs))
+        return 0;
+
+    return 1;
 }
 
 /* When reloading configuration, remove negative diff entries */
@@ -1180,8 +1393,16 @@ clear_diff_services(list old_checkers_queue)
 			   because the VS still exists in new configuration */
 			if (strcmp(vs->sched, new_vs->sched) ||
 			    vs->flags != new_vs->flags ||
+			    vs->proxy_protocol != new_vs->proxy_protocol ||
 			    vs->persistence_granularity != new_vs->persistence_granularity ||
-			    vs->persistence_timeout != new_vs->persistence_timeout) {
+			    vs->persistence_timeout != new_vs->persistence_timeout ||
+				vs->conn_timeout != new_vs->conn_timeout || 
+				vs->bps != new_vs->bps || vs->limit_proportion != new_vs->limit_proportion ||
+				vs->hash_target != new_vs->hash_target || vs->syn_proxy != new_vs->syn_proxy ||
+				vs->expire_quiescent_conn != new_vs->expire_quiescent_conn ||
+				vs->quic != new_vs->quic ||
+				strcmp(vs->srange, new_vs->srange) || strcmp(vs->drange, new_vs->drange) ||
+				strcmp(vs->iifname, new_vs->iifname) || strcmp(vs->oifname, new_vs->oifname)) {
 				ipvs_cmd(IP_VS_SO_SET_EDIT, new_vs, NULL);
 			}
 
@@ -1191,11 +1412,15 @@ clear_diff_services(list old_checkers_queue)
 
 			update_alive_counts(vs, new_vs);
 			/* perform local address diff */
-			if (!clear_diff_laddr(vs))
+			if (!clear_diff_laddr(vs, new_vs))
 				return;
 			/* perform blacklist address diff */
-			if (!clear_diff_blklst(vs))
+			if (!clear_diff_blklst(vs, new_vs))
 				return;
+			/* perform whitelist address diff */
+			if (!clear_diff_whtlst(vs, new_vs))
+				return;
+
 		}
 	}
 }
@@ -1397,3 +1622,13 @@ int clear_diff_tunnel(void)
 	return IPVS_SUCCESS;
 }
 
+void 
+clear_tunnels(void)
+{
+	element e;
+	tunnel_group *group;
+	
+	LIST_FOREACH(check_data->tunnel_group, group, e) {
+		clear_tunnel_group(group);
+	}
+}
