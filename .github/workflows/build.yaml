@@ -18,8 +18,13 @@ jobs:
     env:
       PKG_CONFIG_PATH: /data/dpdk/dpdklib/lib64/pkgconfig
     steps:
-    - uses: actions/checkout@v2
-    - name: make
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Checkout Code
+      uses: actions/checkout@v2
+    - name: build
       run: make -j
       
   build-all:
@@ -27,8 +32,13 @@ jobs:
     env:
       PKG_CONFIG_PATH: /data/dpdk/dpdklib/lib64/pkgconfig
     steps:
-    - uses: actions/checkout@v2
-    - name: config
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Checkout Code
+      uses: actions/checkout@v2
+    - name: Config
       run: sed -i 's/=n$/=y/' config.mk
-    - name: make
+    - name: build
       run: make -j

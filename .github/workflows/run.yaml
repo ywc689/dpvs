@@ -18,10 +18,15 @@ jobs:
     env:
       PKG_CONFIG_PATH: /data/dpdk/dpdklib/lib64/pkgconfig
     steps:
-    - uses: actions/checkout@v2
-    - name: make
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Checkout Code
+      uses: actions/checkout@v2
+    - name: Build
       run: make -j
-    - name: install
+    - name: Install
       run: make install
-    - name: run-dpvs
+    - name: Run DPVS
       run: sudo dpvsci $(pwd)/bin/dpvs
